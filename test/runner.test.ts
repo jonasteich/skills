@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, write
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checks, children, frontier, realExec, refusal, run, summary, updateFromSpec } from "../plugins/workflow/bin/runner.ts";
+import { checks, children, claudeArgs, frontier, realExec, refusal, run, summary, unresolvedFindings, updateFromSpec } from "../plugins/workflow/bin/runner.ts";
 import type { Exec } from "../plugins/workflow/bin/runner.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -127,6 +127,7 @@ test("updateFromSpec: a conflict is left in the worktree, naming the files", asy
 
 type Issue = { number: number; title: string; state: "open" | "closed"; assignees: string[]; labels: string[] };
 type Pr = { number: number; head: string; base: string; state: "open" | "merged"; draft?: boolean; body?: string };
+const reviewed = (unresolved: string) => `Fixed 2 findings.\n\nUnresolved findings:\n${unresolved}\n`;
 
 /** A target repo on disk plus a fake gh/git/claude that keeps GitHub state. */
 function fakeRepo(opts: {
@@ -135,7 +136,8 @@ function fakeRepo(opts: {
   prs?: Pr[];
   specBranch?: boolean;
   ci?: boolean;
-  logs?: Record<number, string>;
+  logs?: Record<number | string, string>;
+  review?: string; // the review child's final reply
   /** Answers a command before the defaults do; undefined falls through. */
   override?: (line: string, o: { cwd?: string; log?: string }, prs: Pr[]) => ReturnType<Exec> | undefined;
 }) {
@@ -190,8 +192,17 @@ function fakeRepo(opts: {
     if (has("gh pr list")) {
       const base = line.match(/--base (\S+)/)![1];
       const head = line.match(/--head (\S+)/)?.[1];
-      const found = prs.filter((p) => p.state === "open" && p.base === base && (!head || p.head === head));
-      return ok(JSON.stringify(found.map((p) => ({ number: p.number, headRefName: p.head }))));
+      const all = has("--state all");
+      const found = prs.filter((p) => (all || p.state === "open") && p.base === base && (!head || p.head === head));
+      return ok(JSON.stringify(found.map((p) => ({ number: p.number, headRefName: p.head, state: p.state.toUpperCase(), isDraft: !!p.draft }))));
+    }
+    if (has("gh pr ready")) {
+      prs.find((p) => p.number === num("ready"))!.draft = false;
+      return ok();
+    }
+    if (has("gh pr edit")) {
+      prs.find((p) => p.number === num("edit"))!.body = args[args.indexOf("--body") + 1];
+      return ok();
     }
     if (has("gh pr create")) {
       const pr: Pr = {
@@ -217,7 +228,8 @@ function fakeRepo(opts: {
     if (cmd === "claude") {
       const id = args[args.indexOf(args.includes("--resume") ? "--resume" : "--session-id") + 1];
       appendFileSync(o.log!, `{"type":"system","subtype":"init","session_id":"${id}"}\n`);
-      appendFileSync(o.log!, `{"type":"result","subtype":"success","is_error":false,"session_id":"${id}"}\n`);
+      const reply = o.log!.endsWith("review.jsonl") ? opts.review ?? reviewed("None") : "Done.";
+      appendFileSync(o.log!, JSON.stringify({ type: "result", subtype: "success", is_error: false, result: reply, session_id: id }) + "\n");
       return ok();
     }
     return ok();
@@ -237,7 +249,7 @@ test("run: builds the frontier into spec/<N>, unblocking as tickets merge", asyn
 
   assert.equal(code, 0);
   assert.ok(at(gh.calls, "git push origin origin/main:refs/heads/spec/1") >= 0, "spec branch not created from main");
-  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude -p /implement"));
   assert.deepEqual(claude.map((c) => c.cwd), [join(gh.repo, ".worktrees/2"), join(gh.repo, ".worktrees/3")]);
   assert.match(claude[0].line, /^claude -p \/implement #2 --session-id [0-9a-f-]{36} /);
   assert.ok(existsSync(join(gh.repo, ".worktrees/logs/2.jsonl")), "child log missing");
@@ -254,7 +266,7 @@ test("run: builds the frontier into spec/<N>, unblocking as tickets merge", asyn
   const specPrs = gh.prs.filter((p) => p.head === "spec/1");
   assert.equal(specPrs.length, 1, "draft spec PR opened once");
   assert.equal(specPrs[0].base, "main");
-  assert.ok(specPrs[0].draft);
+  assert.ok(at(gh.calls, "gh pr create --draft --base main --head spec/1") >= 0, "spec PR not opened as draft");
   assert.match(specPrs[0].body!, /Closes #1, #2, #3/);
   assert.match(readFileSync(join(gh.repo, ".git/info/exclude"), "utf8"), /^\.worktrees\/$/m);
 });
@@ -328,7 +340,8 @@ test("run: a conflict with spec/<N> is resolved in the child's own session, then
   const gh = sameLines(true);
   assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
 
-  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  const inTickets = (c: { cwd?: string }) => /\.worktrees\/[23]$/.test(c.cwd ?? ""); // not the spec review
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude ") && inTickets(c));
   const first = claude[1].line.match(/--session-id (\S+)/)![1];
   assert.equal(claude.length, 3, "one resolution run, no fresh session");
   assert.match(claude[2].line, new RegExp(`^claude -p .*conflict.* --resume ${first} `, "s"));
@@ -357,4 +370,93 @@ test("run: a conflict still failing after the resumed session leaves the ticket 
   assert.equal(gh.issues.get(2)!.state, "closed");
   assert.equal(gh.issues.get(3)!.state, "open");
   assert.ok(said.some((m) => /#3: stuck: merging spec\/1 into ticket\/3 conflicted in f\.txt, still failing/.test(m)), said.join("\n"));
+});
+
+const ticket = (labels: string[]) => ({ number: 3, title: "t", url: "u", open: true, assignees: [], labels, blockedBy: 0 });
+const settings = (args: string[]) => (args.includes("--settings") ? JSON.parse(args[args.indexOf("--settings") + 1]) : null);
+
+test("claudeArgs: non-ui tickets run with the design plugin off", () => {
+  for (const session of [{ id: "s", resume: false }, { id: "s", resume: true }]) {
+    assert.deepEqual(settings(claudeArgs(ticket(["ready-for-agent"]), session)), {
+      enabledPlugins: { "design@skills": false, "impeccable@impeccable": false },
+    });
+  }
+});
+
+test("claudeArgs: ui tickets run with the design plugin as installed", () => {
+  assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: false })), null);
+  assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: true })), null);
+});
+
+// ── Final review ────────────────────────────────────────────────────────────
+
+test("run: once every ticket is closed, reviews spec/<N> once, fixes it there and marks the PR ready", async () => {
+  const gh = fakeRepo({ issues: [open(2)], review: reviewed("- Retry loop has no upper bound\n- Error text is vague") });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  const review = claude.filter((c) => c.cwd === join(gh.repo, ".worktrees/spec-1"));
+  assert.equal(review.length, 2, "one review turn, one fix turn");
+  assert.match(review[0].line, /^claude -p \/code-review spec\/1 --session-id ([0-9a-f-]{36}) /);
+  const id = review[0].line.match(/--session-id (\S+)/)![1];
+  assert.match(review[1].line, new RegExp(`^claude -p .*Unresolved findings:.* --resume ${id} `), "fixes in the same child");
+  assert.ok(at(gh.calls, "gh issue close 2") < gh.calls.indexOf(review[0]), "reviewed before the last ticket closed");
+  assert.ok(at(gh.calls, "git worktree add --detach") >= 0);
+  const push = gh.calls.find((c) => c.line === "git push origin HEAD:refs/heads/spec/1");
+  assert.equal(push?.cwd, join(gh.repo, ".worktrees/spec-1"), "fixes not pushed to spec/1");
+
+  const pr = gh.prs.find((p) => p.head === "spec/1")!;
+  assert.equal(pr.draft, false, "PR not marked ready");
+  assert.match(pr.body!, /Unresolved review findings:\n- Retry loop has no upper bound\n- Error text is vague/);
+  assert.match(pr.body!, /Closes #1, #2/);
+  assert.ok(at(gh.calls, "gh pr edit") < at(gh.calls, "gh pr ready"), "body written before ready");
+});
+
+const closed = (number: number): Issue => ({ ...open(number), state: "closed" });
+const specPr = (draft: boolean, state: Pr["state"] = "open"): Pr => ({ number: 90, head: "spec/1", base: "main", state, draft, body: "old" });
+
+test("run: a rerun after the review doesn't review again", async () => {
+  for (const pr of [specPr(false), specPr(false, "merged")]) {
+    const gh = fakeRepo({ issues: [closed(2)], specBranch: true, prs: [pr] });
+    assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+    assert.equal(at(gh.calls, "claude "), -1, "reviewed twice");
+    assert.equal(at(gh.calls, "gh pr create"), -1, "spec PR opened again");
+    assert.equal(at(gh.calls, "gh pr edit"), -1);
+  }
+});
+
+test("run: no review while tickets are still open", async () => {
+  const gh = fakeRepo({ issues: [closed(2), open(8, ["someone"])], specBranch: true, prs: [specPr(true)] });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 1);
+  assert.equal(at(gh.calls, "/code-review"), -1);
+  assert.equal(gh.prs[0].draft, true);
+});
+
+test("run: an interrupted review resumes with the fix turn only", async () => {
+  const id = "bbbbbbbb-0000-4000-8000-000000000001";
+  const gh = fakeRepo({
+    issues: [closed(2)], specBranch: true, prs: [specPr(true)],
+    logs: { "spec-1-review": `{"type":"system","subtype":"init","session_id":"${id}"}\n{"type":"result","subtype":"success","is_error":false,"result":"3 findings"}\n` },
+  });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  assert.equal(claude.length, 1);
+  assert.match(claude[0].line, new RegExp(`--resume ${id} `));
+  assert.ok(claude[0].line.includes("Unresolved findings:"), "not the fix turn");
+  assert.equal(gh.prs[0].draft, false);
+  assert.doesNotMatch(gh.prs[0].body!, /Unresolved review findings/, "'None' lists nothing");
+});
+
+test("run: a failed review leaves the PR draft for a rerun", async () => {
+  const gh = fakeRepo({ issues: [closed(2)], specBranch: true, prs: [specPr(true)] });
+  const exec: Exec = async (cmd, args, o) => (cmd === "claude" ? { code: 1, stdout: "", stderr: "boom" } : gh.exec(cmd, args, o));
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(exec)), 1);
+  assert.equal(gh.prs[0].draft, true);
+  assert.equal(at(gh.calls, "gh pr ready"), -1);
+});
+
+test("unresolvedFindings: bullets after the last marker; None is empty", () => {
+  assert.deepEqual(unresolvedFindings("x\nUnresolved findings:\n- a\n* b\nthanks"), ["a", "b"]);
+  assert.deepEqual(unresolvedFindings("Unresolved findings:\nNone"), []);
+  assert.deepEqual(unresolvedFindings("no marker\n- a"), []);
 });

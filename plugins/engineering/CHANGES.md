@@ -49,3 +49,11 @@ Added a closing paragraph: recommend `/to-spec` (more than one ticket) or `/to-t
 **Why**: design questions go to the design skill (jonasteich/skills#5).
 
 **Upstream tag**: `v1.3.1`
+
+### setup: renamed from `setup-matt-pocock-skills` to `/setup`
+
+Skill dir moved to `skills/engineering/setup/`, frontmatter `name: setup`, and every `/setup-matt-pocock-skills` reference in the registered skills (code-review, to-spec, to-tickets, triage, wayfinder) now reads `/setup`. Applied by `plugins/workflow/bin/sync` after each pull, so it's reapplied on every sync and a rerun changes nothing; upstream docs, `plugin.json` and dropped skills keep the old name.
+
+**Why**: the setup skill is clearly mine (spec #1, story 7; jonasteich/skills#3).
+
+**Upstream tag**: `v1.3.1`

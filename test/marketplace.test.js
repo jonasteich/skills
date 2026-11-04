@@ -13,7 +13,7 @@ const marketplace = JSON.parse(
 const plugin = (name) => marketplace.plugins.find((p) => p.name === name);
 
 const KEPT_ENGINEERING = [
-  "engineering/setup-matt-pocock-skills",
+  "engineering/setup",
   "engineering/wayfinder",
   "engineering/grill-with-docs",
   "productivity/grilling",
@@ -89,6 +89,20 @@ test("every upstream engineering/productivity skill is kept or dropped", () => {
     for (const d of readdirSync(join(source, group), { withFileTypes: true }))
       if (d.isDirectory() && existsSync(join(source, group, d.name, "SKILL.md")))
         assert.ok(known.has(`./${group}/${d.name}`), `unlisted upstream skill ${group}/${d.name}`);
+});
+
+// bin/sync renames upstream's setup-matt-pocock-skills to /setup on every sync.
+test("the setup skill is registered as /setup with no stale references", () => {
+  const eng = plugin("engineering");
+  const setup = readFileSync(join(root, eng.source, "engineering/setup/SKILL.md"), "utf8");
+  assert.match(setup, /^---\nname: setup\n/);
+  const files = (dir) =>
+    readdirSync(dir, { withFileTypes: true, recursive: true })
+      .filter((d) => d.isFile())
+      .map((d) => join(d.parentPath, d.name));
+  for (const s of eng.skills)
+    for (const f of files(join(root, eng.source, s)))
+      assert.doesNotMatch(readFileSync(f, "utf8"), /(?<![\w-])setup-matt-pocock-skills/, f);
 });
 
 // source is skills/, so the installed copy only gets the license if it's there.

@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# Links the workflow tools from this clone into ~/.local/bin (override with BIN_DIR).
+# install: symlink the fleet's scripts (sync, runner) from this clone into
+# ~/.local/bin (override with BIN_DIR), so they run from any repo. Rerun after
+# adding a script; a missing one is skipped.
 set -euo pipefail
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bin="${BIN_DIR:-$HOME/.local/bin}"
-mkdir -p "$bin"
+here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+target=${BIN_DIR:-$HOME/.local/bin}
+mkdir -p "$target"
 
-for tool in runner; do
-  ln -sfn "$here/$tool" "$bin/$tool"
-  echo "linked $bin/$tool -> $here/$tool"
+for name in sync runner; do
+  [ -f "$here/$name" ] || continue
+  link=$target/$name
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    echo "install: $link exists and is not a symlink; move it away first" >&2
+    exit 1
+  fi
+  ln -sfn "$here/$name" "$link"
+  echo "install: $link -> $here/$name"
 done
 
-case ":$PATH:" in
-  *":$bin:"*) ;;
-  *) echo "note: $bin is not on PATH" ;;
-esac
+case ":$PATH:" in *":$target:"*) ;; *) echo "install: $target is not on PATH; add it" ;; esac
