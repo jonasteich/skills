@@ -10,6 +10,7 @@ A Claude Code plugin marketplace (`.claude-plugin/marketplace.json`). Each upstr
 - To drop a skill, remove it from the entry's `skills` list. Never delete upstream files: they stay in the tree, unregistered, so syncs don't conflict. New upstream skills stay invisible until added to the list.
 - The kept list lives in three places: the entry's `skills`, `test/marketplace.test.js` (kept and dropped lists) and `README.md`. Change all three together, then run `npm test`. The test fails on any upstream skill that is on neither list.
 - `source` is `skills/`, so the installed copy only holds what's under it: keep a copy of upstream's `LICENSE` at `plugins/<name>/skills/LICENSE` (refresh it on sync).
+- **Exception, `design`:** an upstream whose hooks or agents need the plugin root (`${CLAUDE_PLUGIN_ROOT}/skills/...`, root `agents/`) is a strict entry with `source` = the subtree root and no component lists: upstream's `plugin.json` supplies them, as shipped. A non-strict entry there fails to load. Its upstream `version` then pins installs, which only changes on a deliberate tag bump; an edit to its files reaches installs only with that bump. "No `version`" means our own manifests (`marketplace.json`).
 
 ## Syncing an upstream
 
@@ -20,6 +21,16 @@ git subtree pull --prefix=plugins/engineering https://github.com/mattpocock/skil
 ```
 
 Then refresh `skills/LICENSE` from the subtree's `LICENSE`, update the pinned tag in `README.md` and `CHANGES.md`, and run `npm test`: it names any new upstream skill to put on the kept or dropped list.
+
+`design` vendors only impeccable's `plugin/` dir, so it syncs from a split of a full (not blobless) upstream clone kept outside this repo; tags are `skill-v*`:
+
+```
+git clone https://github.com/pbakaus/impeccable "$CACHE"   # once; later: git -C "$CACHE" fetch --tags
+git -C "$CACHE" subtree split --prefix=plugin <tag> -b split/<tag>
+git subtree pull --prefix=plugins/design "$CACHE" split/<tag> --squash
+git -C "$CACHE" show <tag>:LICENSE > plugins/design/LICENSE
+git -C "$CACHE" show <tag>:NOTICE.md > plugins/design/NOTICE.md
+```
 
 ## Customizing
 

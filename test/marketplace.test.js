@@ -141,3 +141,44 @@ test("workflow-retro is user-invoked", () => {
   assert.match(skill, /^---\nname: workflow-retro\n/);
   assert.match(skill, /\ndisable-model-invocation: true\n/);
 });
+
+// design is the one exception to non-strict-over-skills/: impeccable's hooks
+// call ${CLAUDE_PLUGIN_ROOT}/skills/... and its agents live at the root, so the
+// entry is strict over the subtree root and upstream's plugin.json supplies
+// the components (a non-strict entry there fails to load).
+test("design is a strict entry over the subtree root, as shipped", () => {
+  const design = plugin("design");
+  assert.ok(design, "design plugin missing");
+  assert.equal(design.source, "./plugins/design");
+  assert.notEqual(design.strict, false);
+  for (const key of ["skills", "agents", "hooks", "commands"])
+    assert.equal(design[key], undefined, `entry lists ${key}`);
+});
+
+test("design ships upstream's plugin.json, skill, agents and hooks untouched", () => {
+  const dir = join(root, plugin("design").source);
+  const manifest = JSON.parse(readFileSync(join(dir, ".claude-plugin/plugin.json"), "utf8"));
+  assert.equal(manifest.name, "impeccable");
+  assert.equal(manifest.skills, "./skills/");
+  assert.ok(existsSync(join(dir, "skills/impeccable/SKILL.md")));
+  assert.ok(existsSync(join(dir, "skills/impeccable/scripts/impeccable")));
+  const agents = readdirSync(join(dir, "agents")).filter((f) => f.endsWith(".md"));
+  assert.ok(agents.length > 0, "no agents");
+  const hooks = readFileSync(join(dir, "hooks/hooks.json"), "utf8");
+  assert.match(hooks, /\$\{CLAUDE_PLUGIN_ROOT\}\/skills\/impeccable\/scripts\/impeccable/);
+});
+
+// subtree split --prefix=plugin drops upstream's root LICENSE and NOTICE.md,
+// so copies sit at the plugin root (the installed copy).
+test("design carries upstream's Apache-2.0 license and notice", () => {
+  const dir = join(root, plugin("design").source);
+  const license = readFileSync(join(dir, "LICENSE"), "utf8");
+  assert.match(license, /Apache License\s+Version 2\.0/);
+  assert.match(license, /Copyright 2025 Paul Bakaus/);
+  assert.match(readFileSync(join(dir, "NOTICE.md"), "utf8"), /^# Third-Party Notices/);
+});
+
+// The plugin itself keeps upstream's name; nothing of ours is named after it.
+test("nothing of ours is named impeccable", () => {
+  for (const p of marketplace.plugins) assert.doesNotMatch(p.name, /impeccable/i);
+});
