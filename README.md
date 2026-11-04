@@ -1,6 +1,6 @@
 # skills
 
-Jonas Teichrüb's personal Claude Code setup, the **fleet**: a Claude Code plugin marketplace that bundles the upstream skills I use, trimmed to the ones I keep and wired to hand off to each other.
+Jonas Teichrüb's personal Claude Code setup, the **fleet**: a Claude Code plugin marketplace that bundles the upstream skills I use, trimmed to the ones I keep. Small wiring edits (handoffs between skills) land over time and are logged per plugin.
 
 > **Personal setup. Use at your own risk.** It changes when my workflow changes, without notice or migration path. If you want the skills themselves, install them from their upstreams (below).
 
@@ -34,7 +34,7 @@ All skills here are the work of their upstream authors; this repo only selects a
 ## Development
 
 ```
-node --test
+npm test
 ```
 
 checks that the marketplace registers exactly the kept skills. Maintenance rules are in [AGENTS.md](AGENTS.md).

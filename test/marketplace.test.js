@@ -2,7 +2,7 @@
 // and that dropped upstream skills stay in the tree unregistered.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -73,15 +73,31 @@ test("every registered skill exists in the tree", () => {
 });
 
 test("dropped skills stay in the tree but are not registered", () => {
-  const registered = plugin("engineering").skills;
+  const eng = plugin("engineering");
   for (const s of DROPPED_ENGINEERING) {
-    assert.ok(existsSync(join(root, plugin("engineering").source, s, "SKILL.md")), `${s} gone from tree`);
-    assert.ok(!registered.includes(s), `${s} registered`);
+    assert.ok(existsSync(join(root, eng.source, s, "SKILL.md")), `${s} gone from tree`);
+    assert.ok(!eng.skills.includes(s), `${s} registered`);
   }
-  assert.ok(!registered.some((s) => /\/(in-progress|misc|deprecated)\//.test(s)));
 });
 
-test("upstream plugin.json is untouched by the marketplace entry", () => {
+// A sync that brings a new upstream skill fails here until it is put on the
+// kept or dropped list (in-progress/, misc/, deprecated/ are dropped wholesale).
+test("every upstream engineering/productivity skill is kept or dropped", () => {
+  const source = join(root, plugin("engineering").source);
+  const known = new Set([...KEPT_ENGINEERING, ...DROPPED_ENGINEERING]);
+  for (const group of ["engineering", "productivity"])
+    for (const d of readdirSync(join(source, group), { withFileTypes: true }))
+      if (d.isDirectory() && existsSync(join(source, group, d.name, "SKILL.md")))
+        assert.ok(known.has(`./${group}/${d.name}`), `unlisted upstream skill ${group}/${d.name}`);
+});
+
+// source is skills/, so the installed copy only gets the license if it's there.
+test("installed copy carries the upstream MIT license", () => {
+  const license = readFileSync(join(root, plugin("engineering").source, "LICENSE"), "utf8");
+  assert.equal(license, readFileSync(join(root, "plugins/engineering/LICENSE"), "utf8"));
+});
+
+test("upstream plugin.json is left in place with its own full list", () => {
   const upstream = JSON.parse(
     readFileSync(join(root, "plugins/engineering/.claude-plugin/plugin.json"), "utf8"),
   );

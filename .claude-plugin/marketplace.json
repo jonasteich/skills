@@ -9,7 +9,7 @@
     {
       "name": "engineering",
       "source": "./plugins/engineering/skills",
-      "description": "Matt Pocock's engineering skills (mattpocock/skills), kept skills only, with small wiring edits.",
+      "description": "Matt Pocock's engineering skills (mattpocock/skills), kept skills only.",
       "category": "engineering",
       "strict": false,
       "skills": [
