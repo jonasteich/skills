@@ -1,0 +1,39 @@
+{
+  "name": "skills",
+  "owner": {
+    "name": "Jonas Teichrüb",
+    "url": "https://github.com/jonasteich"
+  },
+  "description": "Jonas Teichrüb's personal Claude Code setup (the fleet). Use at your own risk.",
+  "plugins": [
+    {
+      "name": "engineering",
+      "source": "./plugins/engineering/skills",
+      "description": "Matt Pocock's engineering skills (mattpocock/skills), kept skills only, with small wiring edits.",
+      "category": "engineering",
+      "strict": false,
+      "skills": [
+        "./engineering/setup-matt-pocock-skills",
+        "./engineering/wayfinder",
+        "./engineering/grill-with-docs",
+        "./productivity/grilling",
+        "./engineering/domain-modeling",
+        "./engineering/prototype",
+        "./engineering/research",
+        "./engineering/to-spec",
+        "./engineering/to-tickets",
+        "./engineering/implement",
+        "./engineering/tdd",
+        "./engineering/code-review",
+        "./engineering/pr",
+        "./engineering/codebase-design",
+        "./engineering/improve-codebase-architecture",
+        "./engineering/triage",
+        "./engineering/diagnosing-bugs",
+        "./engineering/wizard",
+        "./engineering/retro",
+        "./productivity/writing-for-agents"
+      ]
+    }
+  ]
+}
