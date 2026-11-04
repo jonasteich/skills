@@ -93,12 +93,15 @@ export function sessionOf(log: string): string | null {
   return ids.at(-1)?.[1] ?? null;
 }
 
-/** The child's final result event, if its last turn ended. */
+/**
+ * The child's final result event, if its last turn ended. Claude streams a few
+ * system events after the result, so it's the last result since the last `init`.
+ */
 function result(log: string): any | null {
-  const last = log.trim().split("\n").at(-1);
+  const turn = log.slice(Math.max(0, log.lastIndexOf('"subtype":"init"')));
+  const line = turn.split("\n").findLast((l) => l.includes('"type":"result"'));
   try {
-    const event = JSON.parse(last ?? "");
-    return event.type === "result" ? event : null;
+    return line ? JSON.parse(line) : null;
   } catch {
     return null;
   }

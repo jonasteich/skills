@@ -257,6 +257,8 @@ function fakeRepo(opts: {
       appendFileSync(o.log!, `{"type":"system","subtype":"init","session_id":"${id}"}\n`);
       if (o.log!.endsWith("review.jsonl")) end.result = opts.review ?? reviewed("None");
       appendFileSync(o.log!, JSON.stringify({ type: "result", ...end, permission_denials: [], session_id: id }) + "\n");
+      // Real claude (2.1.318) streams one more event after the result.
+      appendFileSync(o.log!, `{"type":"system","subtype":"task_summary","detail":null,"session_id":"${id}"}\n`);
       return { code: child === "fail" ? 1 : 0, stdout: "", stderr: "" };
     }
     return ok();
