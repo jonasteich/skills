@@ -27,7 +27,7 @@ From a local clone: `/plugin marketplace add ~/Personal/skills`. Our manifests c
 
 Matt Pocock's engineering skills, vendored as a squashed `git subtree` at `plugins/engineering/`. Registered skills:
 
-setup-matt-pocock-skills, wayfinder, grill-with-docs, grilling, domain-modeling, prototype, research, to-spec, to-tickets, implement, tdd, code-review, pr, codebase-design, improve-codebase-architecture, triage, diagnosing-bugs, wizard, retro, writing-for-agents.
+setup (renamed from upstream's setup-matt-pocock-skills), wayfinder, grill-with-docs, grilling, domain-modeling, prototype, research, to-spec, to-tickets, implement, tdd, code-review, pr, codebase-design, improve-codebase-architecture, triage, diagnosing-bugs, wizard, retro, writing-for-agents.
 
 The other upstream skills stay in the tree but are not registered, so they never load. Edits to upstream files are logged in [`plugins/engineering/CHANGES.md`](plugins/engineering/CHANGES.md).
 
@@ -42,11 +42,11 @@ My own workflow tooling at `plugins/workflow/`.
 Command-line tools, linked onto your PATH (`~/.local/bin`) by `plugins/workflow/bin/install` from a clone (they don't ship with `/plugin install`):
 
 - [runner](plugins/workflow/bin/runner.ts): `runner <spec-issue> [--concurrency 2] [--no-ci]`, run inside a target repo's clone, builds a spec's tickets unattended into `spec/<N>`. Each open, unblocked, unassigned child ticket gets a worktree under `.worktrees/` and a headless `claude -p "/implement #N"`; the runner opens the ticket PR, waits for CI, squash-merges it into `spec/<N>`, closes the ticket and opens a draft `spec/<N>` → main PR. All state lives on GitHub (assignee = claim), so a rerun picks up where it stopped. GitHub Issues only; refuses a repo without CI unless `--no-ci`. Needs Node ≥ 23.6, `gh`, `git` and `claude`.
+- [sync](plugins/workflow/bin/sync): `sync <engineering|design> <tag>` pulls an upstream subtree to a pinned tag and reapplies the fleet's fixups (license copies, the `/setup` rename), from any directory. Rerunning it changes nothing.
 
 Registered skills:
 
 - [workflow-retro](plugins/workflow/skills/workflow-retro/SKILL.md): `/workflow-retro [--since <date>] [--repo <path>]` reads session history, transcripts, runner logs and `needs-human` threads, and drafts one issue per recurring skill-chain friction on this repo (label `workflow-retro`). Nothing is filed without an OK.
-
 ## Credits
 
 The `engineering` and `design` skills are the work of their upstream authors; this repo only selects and wires them. `workflow` is my own. Thanks to [Matt Pocock](https://github.com/mattpocock) for [mattpocock/skills](https://github.com/mattpocock/skills) and [Paul Bakaus](https://github.com/pbakaus) for [impeccable](https://github.com/pbakaus/impeccable).

@@ -17,12 +17,19 @@ A Claude Code plugin marketplace (`.claude-plugin/marketplace.json`). Each upstr
 Pinned to upstream **tags**, bumped deliberately. `rerere.enabled` is on in this clone (`git config rerere.enabled true` on a fresh clone) so resolved conflicts replay on the next sync.
 
 ```
+plugins/workflow/bin/sync engineering <tag>   # mattpocock/skills, tags v*
+plugins/workflow/bin/sync design <tag>        # impeccable, tags skill-v*
+```
+
+`sync` needs a clean tree, pulls the subtree, then reapplies and commits the fixups: license copies, and for `engineering` the `/setup` rename (upstream's `setup-matt-pocock-skills` dir moved to `setup/`, references in registered skills rewritten). A rerun to the same tag changes nothing. Any new fixup to upstream files belongs in `sync`, so it survives syncs. On a conflict it stops: resolve, commit, rerun. Then update the pinned tag in `README.md` and `CHANGES.md`, and run `npm test`: it names any new upstream skill to put on the kept or dropped list.
+
+What `sync` runs, for doing it by hand. `engineering`:
+
+```
 git subtree pull --prefix=plugins/engineering https://github.com/mattpocock/skills <tag> --squash
 ```
 
-Then refresh `skills/LICENSE` from the subtree's `LICENSE`, update the pinned tag in `README.md` and `CHANGES.md`, and run `npm test`: it names any new upstream skill to put on the kept or dropped list.
-
-`design` vendors only impeccable's `plugin/` dir, so it syncs from a split of a full (not blobless) upstream clone kept outside this repo; tags are `skill-v*`:
+`design` vendors only impeccable's `plugin/` dir, so it syncs from a split of a full (not blobless) upstream clone kept outside this repo (`sync` uses `~/.cache/skills-sync/impeccable`; the first split of a tag takes minutes):
 
 ```
 git clone https://github.com/pbakaus/impeccable "$CACHE"   # once; later: git -C "$CACHE" fetch --tags
