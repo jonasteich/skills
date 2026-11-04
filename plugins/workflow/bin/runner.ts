@@ -93,12 +93,15 @@ export function sessionOf(log: string): string | null {
   return ids.at(-1)?.[1] ?? null;
 }
 
-/** The child's final result event, if its last turn ended. */
+/**
+ * The child's final result event, if its last turn ended. Claude streams a few
+ * system events after the result, so it's the last result since the last `init`.
+ */
 function result(log: string): any | null {
-  const last = log.trim().split("\n").at(-1);
+  const turn = log.slice(Math.max(0, log.lastIndexOf('"subtype":"init"')));
+  const line = turn.split("\n").findLast((l) => l.includes('"type":"result"'));
   try {
-    const event = JSON.parse(last ?? "");
-    return event.type === "result" ? event : null;
+    return line ? JSON.parse(line) : null;
   } catch {
     return null;
   }
@@ -190,7 +193,9 @@ export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolea
   // marketplace's and impeccable's own, if that is installed too.
   const design = ticket.labels.includes("ui") ? [] : ["--settings", JSON.stringify({ enabledPlugins: DESIGN_OFF })];
   // Headless -p denies anything needing approval unless a mode is set.
-  return [...start, ...design, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
+  // Hook events in the log show whether the design Stop hook ran.
+  const stream = ["--output-format", "stream-json", "--verbose", "--include-hook-events"];
+  return [...start, ...design, ...stream, "--permission-mode", "auto", "--permission-prompts", "none"];
 }
 
 // ── Checks and PRs ─────────────────────────────────────────────────────────
@@ -481,10 +486,14 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..${branch(t)}`], worktree(t)));
     if (!ahead) return giveUp(t, NO_COMMIT);
     await must("git", ["push", "-u", "origin", branch(t)], worktree(t));
-    const body = `Ticket #${t.number} for spec #${spec}, built by the runner. The runner merges it and closes #${t.number}.`;
-    const url = await must("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]);
-    const pr = Number(url.match(/\/pull\/(\d+)/)![1]);
-    say(`#${t.number}: opened PR #${pr}`);
+    // A retry after a CI failure or a conflict pushes to the PR it already has.
+    let pr = (await openTicketPrs()).get(t.number);
+    if (pr === undefined) {
+      const body = `Ticket #${t.number} for spec #${spec}, built by the runner. The runner merges it and closes #${t.number}.`;
+      const url = await must("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]);
+      pr = Number(url.match(/\/pull\/(\d+)/)![1]);
+      say(`#${t.number}: opened PR #${pr}`);
+    } else say(`#${t.number}: pushed to PR #${pr}`);
     waiting.set(t.number, { ticket: t, pr, misses: 0 });
   }
 
@@ -494,10 +503,23 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     say(`#${t.number}: usage limit, pausing children until ${new Date(pausedUntil).toLocaleString()}`);
   }
 
-  /** Merges every waiting PR whose checks passed (all of them under --no-ci). True if any merged. */
+  /**
+   * Brings each waiting PR up to the spec/<N> tip first (GitHub runs no CI on a conflicting
+   * PR), then merges it once its checks pass (all of them under --no-ci). True if any merged.
+   */
   async function pollWaiting(): Promise<boolean> {
     let any = false;
     for (const w of [...waiting.values()]) {
+      const update = await updateTicket(w.ticket);
+      if (update === "stuck") {
+        waiting.delete(w.ticket.number);
+        continue;
+      }
+      // The updated branch needs green CI again before it merges.
+      if (update === "pushed" && ci) {
+        w.misses = 0;
+        continue;
+      }
       const state = ci ? checks(await sh("gh", ["pr", "checks", String(w.pr), "--json", "name,bucket"])) : "pass";
       if (state === "pending" || (state === "none" && ++w.misses < NO_CHECKS_GRACE)) continue;
       waiting.delete(w.ticket.number);
@@ -505,11 +527,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
         await giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
         continue;
       }
-      const update = await updateTicket(w.ticket);
-      if (update === "stuck") continue;
-      // The updated branch needs green CI again before it merges.
-      if (update === "pushed" && ci) waiting.set(w.ticket.number, { ...w, misses: 0 });
-      else any = (await merge(w.ticket, w.pr)) || any;
+      any = (await merge(w.ticket, w.pr)) || any;
     }
     return any;
   }
@@ -563,6 +581,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     await sh("git", ["branch", "-D", branch(t)]);
     await sh("git", ["push", "origin", "--delete", branch(t)]);
     t.open = false;
+    for (const s of tickets) if (s.number === t.number) s.open = false; // `t` may be from an earlier snapshot
     merged.push({ ticket: t, pr });
     say(`#${t.number}: merged PR #${pr} into ${specBranch}`);
     await ensureSpecPr();
@@ -577,7 +596,8 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const found: SpecPr[] = JSON.parse(out);
     if (found.length) return found[0];
     const body = specPrBody({ number: spec, url: specIssue.url }, tickets);
-    const url = await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", `Spec #${spec}: ${specIssue.title}`, "--body", body]);
+    const title = `Spec #${spec}: ${specIssue.title.replace(/^Spec:\s*/i, "")}`; // /to-spec titles start "Spec: "
+    const url = await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", title, "--body", body]);
     say(`Opened draft PR ${specBranch} → ${main}`);
     return { number: Number(url.match(/\/pull\/(\d+)/)![1]), state: "OPEN", isDraft: true };
   }

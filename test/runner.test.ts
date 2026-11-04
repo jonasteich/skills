@@ -257,6 +257,8 @@ function fakeRepo(opts: {
       appendFileSync(o.log!, `{"type":"system","subtype":"init","session_id":"${id}"}\n`);
       if (o.log!.endsWith("review.jsonl")) end.result = opts.review ?? reviewed("None");
       appendFileSync(o.log!, JSON.stringify({ type: "result", ...end, permission_denials: [], session_id: id }) + "\n");
+      // Real claude (2.1.318) streams one more event after the result.
+      appendFileSync(o.log!, `{"type":"system","subtype":"task_summary","detail":null,"session_id":"${id}"}\n`);
       return { code: child === "fail" ? 1 : 0, stdout: "", stderr: "" };
     }
     return ok();
@@ -296,6 +298,24 @@ test("run: builds the frontier into spec/<N>, unblocking as tickets merge", asyn
   assert.ok(at(gh.calls, "gh pr create --draft --base main --head spec/1") >= 0, "spec PR not opened as draft");
   assert.match(specPrs[0].body!, /Closes #1, #2, #3/);
   assert.match(readFileSync(join(gh.repo, ".git/info/exclude"), "utf8"), /^\.worktrees\/$/m);
+});
+
+test("run: the spec PR title doesn't repeat a spec issue's own 'Spec:' prefix", async () => {
+  const spec = JSON.stringify({ title: "Spec: tiny math module", url: "https://github.com/o/r/issues/1" });
+  const gh = fakeRepo({
+    issues: [open(2)],
+    override: (line) => (line === "gh issue view 1 --json title,url" ? Promise.resolve({ code: 0, stdout: spec, stderr: "" }) : undefined),
+  });
+  await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+  const create = gh.calls.find((c) => c.line.startsWith("gh pr create --draft"))!.line;
+  assert.match(create, /--title Spec #1: tiny math module --body/);
+});
+
+test("run: the draft spec PR, opened after the first merge, ticks the merged ticket", async () => {
+  const gh = fakeRepo({ issues: [open(2), open(3)], blockers: { 3: [2] } });
+  await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+  const create = gh.calls.find((c) => c.line.startsWith("gh pr create --draft"))!.line;
+  assert.match(create, /- \[x\] #2 Ticket 2\n- \[ \] #3 Ticket 3/);
 });
 
 test("run: a rerun after a crash picks up where it stopped", async () => {
@@ -381,6 +401,21 @@ test("run: removing needs-human retries the ticket fresh, with Jonas's answer as
   assert.equal(gh.issues.get(2)!.state, "closed");
 });
 
+test("run: a retried ticket whose PR is still open pushes to that PR instead of opening another", async () => {
+  const gh = fakeRepo({
+    issues: [open(2)],
+    prs: [{ number: 50, head: "ticket/2", base: "spec/1", state: "open" }],
+    logs: { 2: `{"type":"system","subtype":"init","session_id":"old-session"}\n{"type":"result","subtype":"success","is_error":false,"result":"Done."}\n` },
+    specBranch: true,
+  });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+
+  assert.equal(gh.calls.filter((c) => c.line.startsWith("claude -p /implement #2")).length, 1, "retried fresh");
+  assert.equal(at(gh.calls, "gh pr create --base spec/1"), -1, "no second ticket PR");
+  assert.equal(gh.prs.find((p) => p.number === 50)!.state, "merged");
+  assert.equal(gh.issues.get(2)!.state, "closed");
+});
+
 test("clean: removes leftover ticket worktrees, keeps the logs", async () => {
   const gh = fakeRepo({ issues: [], logs: { 2: "{}\n", 10: "{}\n", "spec-1": "{}\n" } });
   assert.equal(await clean(gh.repo, deps(gh.exec)), 0);
@@ -398,7 +433,8 @@ test("clean: removes leftover ticket worktrees, keeps the logs", async () => {
 
 /**
  * #2 and #3 touch the same lines: once #2 merges, #3's branch conflicts with spec/1.
- * `resolves` says whether #3's resumed session clears the conflict.
+ * `resolves` says whether #3's resumed session clears the conflict. Like GitHub, CI
+ * doesn't run on #3's PR while it conflicts.
  */
 function sameLines(resolves: boolean) {
   let fixed = false;
@@ -412,6 +448,11 @@ function sameLines(resolves: boolean) {
       if (line.startsWith("git merge --no-edit") && in3) return res(1, "", "CONFLICT (content)");
       if (line.startsWith("git diff --name-only --diff-filter=U") && in3 && !fixed) return res(0, "f.txt\n");
       if (line.startsWith("git rev-parse -q --verify MERGE_HEAD")) return res(1);
+      const pr3 = prs.find((p) => p.head === "ticket/3");
+      const conflicting = prs.some((p) => p.head === "ticket/2" && p.state === "merged") && !fixed;
+      if (pr3 && line.startsWith(`gh pr checks ${pr3.number}`) && conflicting) {
+        return res(1, "", "no checks reported on the 'ticket/3' branch");
+      }
       if (line.startsWith("claude ") && line.includes("--resume")) {
         fixed = resolves;
         const id = line.match(/--resume (\S+)/)![1];
@@ -474,6 +515,14 @@ test("claudeArgs: non-ui tickets run with the design plugin off", () => {
 test("claudeArgs: ui tickets run with the design plugin as installed", () => {
   assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: false })), null);
   assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: true })), null);
+});
+
+test("claudeArgs: child logs record hook events, so a log shows whether the design Stop hook ran", () => {
+  for (const labels of [["ui"], []]) {
+    for (const session of [{ id: "s", resume: false }, { id: "s", resume: true }]) {
+      assert.ok(claudeArgs(ticket(labels), session).includes("--include-hook-events"));
+    }
+  }
 });
 
 // ── Final review ────────────────────────────────────────────────────────────
