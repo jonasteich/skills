@@ -499,10 +499,23 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     say(`#${t.number}: usage limit, pausing children until ${new Date(pausedUntil).toLocaleString()}`);
   }
 
-  /** Merges every waiting PR whose checks passed (all of them under --no-ci). True if any merged. */
+  /**
+   * Brings each waiting PR up to the spec/<N> tip first (GitHub runs no CI on a conflicting
+   * PR), then merges it once its checks pass (all of them under --no-ci). True if any merged.
+   */
   async function pollWaiting(): Promise<boolean> {
     let any = false;
     for (const w of [...waiting.values()]) {
+      const update = await updateTicket(w.ticket);
+      if (update === "stuck") {
+        waiting.delete(w.ticket.number);
+        continue;
+      }
+      // The updated branch needs green CI again before it merges.
+      if (update === "pushed" && ci) {
+        w.misses = 0;
+        continue;
+      }
       const state = ci ? checks(await sh("gh", ["pr", "checks", String(w.pr), "--json", "name,bucket"])) : "pass";
       if (state === "pending" || (state === "none" && ++w.misses < NO_CHECKS_GRACE)) continue;
       waiting.delete(w.ticket.number);
@@ -510,11 +523,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
         await giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
         continue;
       }
-      const update = await updateTicket(w.ticket);
-      if (update === "stuck") continue;
-      // The updated branch needs green CI again before it merges.
-      if (update === "pushed" && ci) waiting.set(w.ticket.number, { ...w, misses: 0 });
-      else any = (await merge(w.ticket, w.pr)) || any;
+      any = (await merge(w.ticket, w.pr)) || any;
     }
     return any;
   }

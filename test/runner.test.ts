@@ -418,7 +418,8 @@ test("clean: removes leftover ticket worktrees, keeps the logs", async () => {
 
 /**
  * #2 and #3 touch the same lines: once #2 merges, #3's branch conflicts with spec/1.
- * `resolves` says whether #3's resumed session clears the conflict.
+ * `resolves` says whether #3's resumed session clears the conflict. Like GitHub, CI
+ * doesn't run on #3's PR while it conflicts.
  */
 function sameLines(resolves: boolean) {
   let fixed = false;
@@ -432,6 +433,11 @@ function sameLines(resolves: boolean) {
       if (line.startsWith("git merge --no-edit") && in3) return res(1, "", "CONFLICT (content)");
       if (line.startsWith("git diff --name-only --diff-filter=U") && in3 && !fixed) return res(0, "f.txt\n");
       if (line.startsWith("git rev-parse -q --verify MERGE_HEAD")) return res(1);
+      const pr3 = prs.find((p) => p.head === "ticket/3");
+      const conflicting = prs.some((p) => p.head === "ticket/2" && p.state === "merged") && !fixed;
+      if (pr3 && line.startsWith(`gh pr checks ${pr3.number}`) && conflicting) {
+        return res(1, "", "no checks reported on the 'ticket/3' branch");
+      }
       if (line.startsWith("claude ") && line.includes("--resume")) {
         fixed = resolves;
         const id = line.match(/--resume (\S+)/)![1];
