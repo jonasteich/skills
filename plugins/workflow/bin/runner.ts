@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // runner <spec-issue> [--concurrency 2] [--no-ci]
+// runner clean     (removes worktrees kept for needs-human tickets)
 //
 // Builds a spec's tickets unattended into the integration branch spec/<N>:
 // each unblocked ticket gets a worktree and a headless `claude -p "/implement #N"`;
@@ -12,7 +13,7 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -114,10 +115,11 @@ export function failure(code: number, log: string): string | null {
 }
 
 /** Arguments for a fresh child, or for resuming one whose session already exists. */
-export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean }): string[] {
+/** `context` (a retry's answer from Jonas) follows the fresh prompt. */
+export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean }, context = ""): string[] {
   const start = session.resume
     ? ["-p", "continue", "--resume", session.id]
-    : ["-p", `/implement #${ticket.number}`, "--session-id", session.id];
+    : ["-p", `/implement #${ticket.number}${context && `\n\n${context}`}`, "--session-id", session.id];
   // Headless -p denies anything needing approval unless a mode is set.
   // Seam: #11 adds `--settings` from the ticket's `ui` label here.
   return [...start, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
@@ -164,6 +166,39 @@ export function summary(merged: Merged[], stuck: Stuck[], tickets: Ticket[]): st
     `Stuck (${stuck.length}):`, ...stuck.map((s) => line(s.ticket, `${s.why}, log ${s.log}`)),
     `Still open (${open.length}):`, ...open.map((t) => line(t, why(t))),
   ].join("\n");
+}
+
+/** A child that ends its turn without a commit has stopped to ask something. */
+export const NO_COMMIT = "claude finished without committing";
+/** Marks the runner's `needs-human` comments, so a retry knows which comments came after. */
+export const NEEDS_HUMAN_MARK = "<!-- runner:needs-human -->";
+
+/** The `needs-human` comment: Claude's question, or why the runner stopped plus a log summary. */
+export function needsHuman(why: string, log: string, at: { log: string; worktree: string }): string {
+  const end = result(log);
+  const said = String(end?.result ?? "").trim();
+  const quote = (text: string) => text.split("\n").map((l) => `> ${l}`).join("\n");
+  const head = why === NO_COMMIT && said ? "Claude stopped with a question:" : `The runner stopped on this ticket: ${why}.`;
+  const last = said && why !== NO_COMMIT ? ["", "Claude's last message:", "", quote(said)] : said ? ["", quote(said)] : [];
+  const denied = end?.permission_denials?.length ? `, ${end.permission_denials.length} permission denials` : "";
+  const stats = end ? ` (${end.subtype}, ${end.num_turns ?? "?"} turns${denied})` : " (no result: the child was cut off)";
+  return [
+    NEEDS_HUMAN_MARK,
+    head,
+    ...last,
+    "",
+    `Log: \`${at.log}\`${stats}`,
+    `Worktree kept for inspection: \`${at.worktree}\``,
+    "",
+    "Answer or fix here, then remove the `needs-human` label: the runner retries with your comment as extra context.",
+  ].join("\n");
+}
+
+/** Comments after the runner's last `needs-human` comment (`gh issue view --json comments`). */
+export function answers(json: string): string {
+  const bodies: string[] = JSON.parse(json).comments.map((c: any) => c.body);
+  const mark = bodies.findLastIndex((b) => b.includes(NEEDS_HUMAN_MARK));
+  return bodies.slice(mark + 1).join("\n\n---\n\n").trim();
 }
 
 // ── Exec seam: every gh, git and claude call goes through here ─────────────
@@ -232,6 +267,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   const merged: Merged[] = [];
   const stuck: Stuck[] = [];
   let tickets: Ticket[] = [];
+  let labelReady: Promise<string> | undefined; // `needs-human` created once per run
 
   while (true) {
     tickets = children(await must("gh", ["api", `repos/{owner}/{repo}/issues/${spec}/sub_issues`, "--paginate", "--slurp"]));
@@ -288,6 +324,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   /** Worktree + branch off spec/<N>, then `claude -p`; resumes the session if its log has one. */
   async function startChild(t: Ticket): Promise<Done> {
     const dir = worktree(t);
+    const context = !t.assignees.includes(me) && (existsSync(dir) || existsSync(logOf(t))) ? await retry(t) : "";
     if (!existsSync(dir)) {
       const exists = (await sh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch(t)}`])).code === 0;
       await must("git", exists ? ["worktree", "add", dir, branch(t)] : ["worktree", "add", "-b", branch(t), dir, `origin/${specBranch}`]);
@@ -297,9 +334,21 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     if (failure(0, log) === null) return { ticket: t, code: 0 }; // finished before a crash
     const id = sessionOf(log);
     say(`#${t.number}: ${id ? "resuming" : "starting"} claude in ${dir}`);
-    const args = claudeArgs(t, id ? { id, resume: true } : { id: randomUUID(), resume: false });
+    const args = claudeArgs(t, id ? { id, resume: true } : { id: randomUUID(), resume: false }, context);
     const out = await exec("claude", args, { cwd: dir, log: logOf(t) });
     return { ticket: t, code: out.code };
+  }
+
+  /**
+   * A ticket we gave up on earlier is takeable again: Jonas removed `needs-human`.
+   * Drops the old worktree, keeps the old log aside, returns his answer for the fresh child.
+   */
+  async function retry(t: Ticket): Promise<string> {
+    await sh("git", ["worktree", "remove", "--force", worktree(t)]);
+    if (existsSync(logOf(t))) renameSync(logOf(t), logOf(t).replace(/\.jsonl$/, `.${Date.now()}.jsonl`));
+    const answer = answers(await must("gh", ["issue", "view", String(t.number), "--json", "comments"]));
+    say(`#${t.number}: retrying after needs-human`);
+    return answer && `This is a retry: the runner stopped on this ticket earlier. Jonas answered on the ticket:\n\n${answer}`;
   }
 
   /** A child exited: push its branch and open the ticket PR into spec/<N>. */
@@ -307,7 +356,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const why = failure(code, existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "");
     if (why) return giveUp(t, why);
     const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..${branch(t)}`], worktree(t)));
-    if (!ahead) return giveUp(t, "claude finished without committing");
+    if (!ahead) return giveUp(t, NO_COMMIT);
     await must("git", ["push", "-u", "origin", branch(t)], worktree(t));
     const body = `Ticket #${t.number} for spec #${spec}, built by the runner. The runner merges it and closes #${t.number}.`;
     const url = await must("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]);
@@ -325,7 +374,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
       if (state === "pending" || (state === "none" && ++w.misses < NO_CHECKS_GRACE)) continue;
       waiting.delete(w.ticket.number);
       if (state === "pass") any = (await merge(w.ticket, w.pr)) || any;
-      else giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
+      else await giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
     }
     return any;
   }
@@ -333,7 +382,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   async function merge(t: Ticket, pr: number): Promise<boolean> {
     const out = await sh("gh", ["pr", "merge", String(pr), "--squash"]);
     if (out.code !== 0) {
-      giveUp(t, `merge of PR #${pr} failed: ${out.stderr.trim()}`);
+      await giveUp(t, `merge of PR #${pr} failed: ${out.stderr.trim()}`);
       return false;
     }
     // Closing keywords only fire on the default branch, so close the ticket here.
@@ -357,17 +406,36 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     say(`Opened draft PR ${specBranch} → ${main}`);
   }
 
-  /** Stops working a ticket for this run; its worktree stays for inspection. */
-  // Seam: #8 comments the reason + log summary, labels needs-human and unassigns.
-  function giveUp(t: Ticket, why: string) {
+  /**
+   * Hands a ticket to Jonas: comment (the question, or why + a log summary), `needs-human`, unassign.
+   * Its worktree stays for inspection; removing the label makes it takeable again.
+   */
+  async function giveUp(t: Ticket, why: string) {
     stuck.push({ ticket: t, why, log: logOf(t) });
     say(`#${t.number}: stuck: ${why}`);
+    const log = existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "";
+    await must("gh", ["issue", "comment", String(t.number), "--body", needsHuman(why, log, { log: logOf(t), worktree: worktree(t) })]);
+    labelReady ??= must("gh", ["label", "create", "needs-human", "--color", "D93F0B", "--description", "Runner stopped: needs Jonas", "--force"]);
+    await labelReady;
+    await must("gh", ["issue", "edit", String(t.number), "--add-label", "needs-human", "--remove-assignee", "@me"]);
   }
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
-const usage = "usage: runner <spec-issue> [--concurrency 2] [--no-ci]";
+/** `runner clean`: removes the ticket worktrees left in .worktrees/ (kept on needs-human). Logs stay. */
+export async function clean(repo: string, deps: Deps): Promise<number> {
+  const root = join(repo, ".worktrees");
+  const dirs = existsSync(root) ? readdirSync(root).filter((d) => /^\d+$/.test(d)).sort((a, b) => Number(a) - Number(b)) : [];
+  for (const d of dirs) {
+    const out = await deps.exec("git", ["worktree", "remove", "--force", join(root, d)], { cwd: repo });
+    deps.say(out.code === 0 ? `Removed .worktrees/${d}` : `Couldn't remove .worktrees/${d}: ${out.stderr.trim()}`);
+  }
+  await deps.exec("git", ["worktree", "prune"], { cwd: repo });
+  return 0;
+}
+
+const usage = "usage: runner <spec-issue> [--concurrency 2] [--no-ci]\n       runner clean";
 
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
@@ -376,10 +444,10 @@ async function main(argv: string[]): Promise<number> {
     allowNegative: true,
     options: { ci: { type: "boolean", default: true }, concurrency: { type: "string", default: "2" } },
   });
+  const cleaning = positionals.length === 1 && positionals[0] === "clean";
   const spec = Number(positionals[0]);
   const concurrency = Number(values.concurrency);
-  // Seam: #8 adds `runner clean`.
-  if (positionals.length !== 1 || !Number.isInteger(spec) || !(concurrency >= 1)) {
+  if (!cleaning && (positionals.length !== 1 || !Number.isInteger(spec) || !(concurrency >= 1))) {
     console.error(usage);
     return 2;
   }
@@ -389,6 +457,7 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
   const deps: Deps = { exec: realExec, sleep, say: (msg) => console.error(msg) };
+  if (cleaning) return clean(top.stdout.trim(), deps);
   return run({ spec, repo: top.stdout.trim(), ci: values.ci!, concurrency }, deps);
 }
 

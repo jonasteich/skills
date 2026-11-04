@@ -2,11 +2,11 @@
 // exec seam, so these tests feed it recorded outputs (test/fixtures/).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checks, children, frontier, refusal, run, summary } from "../plugins/workflow/bin/runner.ts";
+import { checks, children, clean, frontier, refusal, run, summary } from "../plugins/workflow/bin/runner.ts";
 import type { Exec } from "../plugins/workflow/bin/runner.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -68,7 +68,9 @@ test("summary: lists merged, stuck and still-open tickets with links", () => {
 
 // ── The loop, against a fake GitHub ─────────────────────────────────────────
 
-type Issue = { number: number; title: string; state: "open" | "closed"; assignees: string[]; labels: string[] };
+type Issue = { number: number; title: string; state: "open" | "closed"; assignees: string[]; labels: string[]; comments?: string[] };
+/** How a fake child ends: done (it committed), fail, or ask (ends with a question, no commit). */
+type Child = "done" | "fail" | { ask: string };
 type Pr = { number: number; head: string; base: string; state: "open" | "merged"; draft?: boolean; body?: string };
 
 /** A target repo on disk plus a fake gh/git/claude that keeps GitHub state. */
@@ -79,6 +81,7 @@ function fakeRepo(opts: {
   specBranch?: boolean;
   ci?: boolean;
   logs?: Record<number, string>;
+  child?: Record<number, Child>;
 }) {
   const repo = mkdtempSync(join(tmpdir(), "runner-"));
   mkdirSync(join(repo, "docs/agents"), { recursive: true });
@@ -109,6 +112,10 @@ function fakeRepo(opts: {
 
     if (has("gh api user")) return ok("jonasteich\n");
     if (has("gh repo view")) return ok("main\n");
+    if (has("gh issue view") && has("--json comments")) {
+      const comments = (issues.get(num("view"))!.comments ?? []).map((body) => ({ body }));
+      return ok(JSON.stringify({ comments }));
+    }
     if (has("gh issue view")) return ok(JSON.stringify({ title: "The spec", url: "https://github.com/o/r/issues/1" }));
     if (has("/sub_issues")) {
       const page = [...issues.values()].map((i) => ({
@@ -120,6 +127,16 @@ function fakeRepo(opts: {
     }
     if (has("gh issue edit") && has("--add-assignee @me")) {
       issues.get(num("edit"))!.assignees.push("jonasteich");
+      return ok();
+    }
+    if (has("gh issue edit")) {
+      const issue = issues.get(num("edit"))!;
+      if (has("--add-label needs-human")) issue.labels.push("needs-human");
+      if (has("--remove-assignee @me")) issue.assignees = issue.assignees.filter((a) => a !== "jonasteich");
+      return ok();
+    }
+    if (has("gh issue comment")) {
+      (issues.get(num("comment"))!.comments ??= []).push(args[args.indexOf("--body") + 1]);
       return ok();
     }
     if (has("gh issue close")) {
@@ -151,13 +168,23 @@ function fakeRepo(opts: {
       return ok();
     }
     if (has("git rev-parse --git-path info/exclude")) return ok(".git/info/exclude\n");
-    if (has("git rev-parse --verify")) return { code: 1, stdout: "", stderr: "" };
-    if (has("git rev-list --count")) return ok("1\n"); // the child committed
+    if (has("git worktree remove")) {
+      rmSync(args[3], { recursive: true, force: true });
+      return ok();
+    }
+    if (has("git rev-parse --verify"))return { code: 1, stdout: "", stderr: "" };
+    const childOf = (cwd?: string) => opts.child?.[Number(cwd?.match(/\/(\d+)$/)?.[1])] ?? "done";
+    if (has("git rev-list --count")) return ok(childOf(o.cwd) === "done" ? "1\n" : "0\n");
     if (cmd === "claude") {
       const id = args[args.indexOf(args.includes("--resume") ? "--resume" : "--session-id") + 1];
+      const child = childOf(o.cwd);
+      const end =
+        child === "fail"
+          ? { subtype: "error_during_execution", is_error: true, result: "Tests kept failing", num_turns: 12 }
+          : { subtype: "success", is_error: false, result: child === "done" ? "Done." : child.ask, num_turns: 3 };
       appendFileSync(o.log!, `{"type":"system","subtype":"init","session_id":"${id}"}\n`);
-      appendFileSync(o.log!, `{"type":"result","subtype":"success","is_error":false,"session_id":"${id}"}\n`);
-      return ok();
+      appendFileSync(o.log!, JSON.stringify({ type: "result", ...end, permission_denials: [], session_id: id }) + "\n");
+      return { code: child === "fail" ? 1 : 0, stdout: "", stderr: "" };
     }
     return ok();
   };
@@ -233,4 +260,64 @@ test("run: refuses before touching GitHub", async () => {
   const gh = fakeRepo({ issues: [open(2)], ci: false });
   assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 2);
   assert.deepEqual(gh.calls, []);
+});
+
+test("run: a failing child gets needs-human, the others keep running", async () => {
+  const gh = fakeRepo({ issues: [open(2), open(3)], child: { 2: "fail" } });
+  const code = await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+
+  assert.equal(code, 1, "#2 is stuck");
+  const two = gh.issues.get(2)!;
+  assert.deepEqual([two.state, two.labels, two.assignees], ["open", ["needs-human"], []]);
+  assert.equal(two.comments?.length, 1);
+  assert.match(two.comments![0], /claude exited 1/);
+  assert.match(two.comments![0], /Tests kept failing/);
+  assert.ok(two.comments![0].includes(join(gh.repo, ".worktrees/logs/2.jsonl")), "comment links the log");
+  assert.ok(at(gh.calls, "gh label create needs-human") >= 0, "label created if missing");
+  assert.ok(at(gh.calls, "gh label create needs-human") < at(gh.calls, "--add-label needs-human"));
+  const removed = gh.calls.filter((c) => c.line.includes("worktree remove")).map((c) => c.line);
+  assert.deepEqual(removed, [`git worktree remove --force ${join(gh.repo, ".worktrees/3")}`], "#2's worktree kept");
+  assert.equal(gh.issues.get(3)!.state, "closed", "#3 still merged");
+});
+
+test("run: a child that asks a question puts the question on the ticket", async () => {
+  const gh = fakeRepo({ issues: [open(2)], child: { 2: { ask: "Should the label be red\nor orange?" } } });
+  await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+
+  const [comment] = gh.issues.get(2)!.comments!;
+  assert.match(comment, /Claude stopped with a question:\n\n> Should the label be red\n> or orange\?/);
+  assert.deepEqual(gh.issues.get(2)!.labels, ["needs-human"]);
+  assert.equal(at(gh.calls, "gh pr create --base spec/1"), -1, "no PR without a commit");
+});
+
+test("run: removing needs-human retries the ticket fresh, with Jonas's answer as context", async () => {
+  const gh = fakeRepo({
+    issues: [{ ...open(2), comments: ["Earlier chatter", "<!-- runner:needs-human -->\nClaude stopped with a question:\n\n> Red or orange?", "Orange, please."] }],
+    logs: { 2: `{"type":"system","subtype":"init","session_id":"old-session"}\n{"type":"result","subtype":"success","is_error":false,"result":"Red or orange?"}\n` },
+    specBranch: true,
+  });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+
+  const removed = at(gh.calls, `git worktree remove --force ${join(gh.repo, ".worktrees/2")}`);
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  assert.ok(removed >= 0 && removed < gh.calls.indexOf(claude[0]), "old worktree removed before the retry");
+  assert.equal(claude.length, 1);
+  assert.match(claude[0].line, /^claude -p \/implement #2\n[^]*Orange, please\.[^]* --session-id [0-9a-f-]{36} /);
+  assert.doesNotMatch(claude[0].line, /Earlier chatter|old-session/);
+  assert.doesNotMatch(readFileSync(join(gh.repo, ".worktrees/logs/2.jsonl"), "utf8"), /old-session/, "fresh log");
+  assert.equal(gh.issues.get(2)!.state, "closed");
+});
+
+test("clean: removes leftover ticket worktrees, keeps the logs", async () => {
+  const gh = fakeRepo({ issues: [], logs: { 2: "{}\n", 5: "{}\n" } });
+  assert.equal(await clean(gh.repo, deps(gh.exec)), 0);
+
+  const git = gh.calls.filter((c) => c.line.startsWith("git worktree")).map((c) => c.line);
+  assert.deepEqual(git, [
+    `git worktree remove --force ${join(gh.repo, ".worktrees/2")}`,
+    `git worktree remove --force ${join(gh.repo, ".worktrees/5")}`,
+    "git worktree prune",
+  ]);
+  assert.deepEqual(readdirSync(join(gh.repo, ".worktrees")), ["logs"]);
+  assert.deepEqual(readdirSync(join(gh.repo, ".worktrees/logs")).sort(), ["2.jsonl", "5.jsonl"]);
 });
