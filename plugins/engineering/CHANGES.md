@@ -57,3 +57,27 @@ Skill dir moved to `skills/engineering/setup/`, frontmatter `name: setup`, and e
 **Why**: the setup skill is clearly mine (spec #1, story 7; jonasteich/skills#3).
 
 **Upstream tag**: `v1.3.1`
+
+### setup: Section D writes `docs/agents/design.md` and creates the `ui` label
+
+`SKILL.md` adds a Design docs bullet, explores `DESIGN.md` / `PRODUCT.md`, a new Section D (always runs: write `docs/agents/design.md`, create `ui` on the chosen tracker, frontmatter tag on local), a `### Design docs` entry in the Agent skills block, and the new seed template `design.md`. Tracker menu unchanged.
+
+**Why**: every repo gets the design wiring (spec #1, story 8; jonasteich/skills#6).
+
+**Upstream tag**: `v1.3.1`
+
+### to-spec, to-tickets, implement: read design docs for UI work
+
+One line each: for UI work, read the design docs per `docs/agents/design.md`.
+
+**Why**: UI tickets follow the design system (spec #1, story 9; jonasteich/skills#6).
+
+**Upstream tag**: `v1.3.1`
+
+### to-tickets: apply `ui` to tickets a user sees
+
+Step 5 applies the `ui` label to each ticket that changes something a user sees (`labels: [ui]` frontmatter tag on local files).
+
+**Why**: the runner and audits tell UI tickets apart by it (spec #1, story 10; jonasteich/skills#6).
+
+**Upstream tag**: `v1.3.1`
