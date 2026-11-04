@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Links the workflow tools from this clone into ~/.local/bin (override with BIN_DIR).
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bin="${BIN_DIR:-$HOME/.local/bin}"
+mkdir -p "$bin"
+
+for tool in runner; do
+  ln -sfn "$here/$tool" "$bin/$tool"
+  echo "linked $bin/$tool -> $here/$tool"
+done
+
+case ":$PATH:" in
+  *":$bin:"*) ;;
+  *) echo "note: $bin is not on PATH" ;;
+esac
