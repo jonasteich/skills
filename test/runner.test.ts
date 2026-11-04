@@ -311,6 +311,13 @@ test("run: the spec PR title doesn't repeat a spec issue's own 'Spec:' prefix", 
   assert.match(create, /--title Spec #1: tiny math module --body/);
 });
 
+test("run: the draft spec PR, opened after the first merge, ticks the merged ticket", async () => {
+  const gh = fakeRepo({ issues: [open(2), open(3)], blockers: { 3: [2] } });
+  await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+  const create = gh.calls.find((c) => c.line.startsWith("gh pr create --draft"))!.line;
+  assert.match(create, /- \[x\] #2 Ticket 2\n- \[ \] #3 Ticket 3/);
+});
+
 test("run: a rerun after a crash picks up where it stopped", async () => {
   const gh = fakeRepo({
     issues: [open(2, ["jonasteich"]), open(4, ["jonasteich"]), open(6, ["jonasteich"]), open(8, ["someone"])],

@@ -568,6 +568,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     await sh("git", ["branch", "-D", branch(t)]);
     await sh("git", ["push", "origin", "--delete", branch(t)]);
     t.open = false;
+    for (const s of tickets) if (s.number === t.number) s.open = false; // `t` may be from an earlier snapshot
     merged.push({ ticket: t, pr });
     say(`#${t.number}: merged PR #${pr} into ${specBranch}`);
     await ensureSpecPr();
