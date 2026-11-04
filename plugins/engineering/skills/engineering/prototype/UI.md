@@ -45,6 +45,8 @@ This works whether the user is here to push back or not.
 
 ### 2. Generate radically different variants
 
+Get the design direction from the design skill: call the Skill tool with `impeccable`, give it the question and N, and ask for N structurally different directions (it reads `DESIGN.md` / `PRODUCT.md` if present). If it isn't installed, draft the directions yourself. This file's rules still win: throwaway code, one route behind `?variant=`, the switcher, no polish, and the capture in step 6.
+
 Draft each variant. Hold each one to:
 
 - The page's purpose and the data it has access to.
