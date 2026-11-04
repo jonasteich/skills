@@ -114,15 +114,22 @@ export function failure(code: number, log: string): string | null {
   return null;
 }
 
-/** Arguments for a fresh child, or for resuming one whose session already exists. */
-/** `context` (a retry's answer from Jonas) follows the fresh prompt. */
+const DESIGN_OFF = { "design@skills": false, "impeccable@impeccable": false };
+
+/**
+ * Arguments for a fresh child, or for resuming one whose session already exists.
+ * `context` (a retry's answer from Jonas) follows the fresh prompt.
+ */
 export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean }, context = ""): string[] {
   const start = session.resume
     ? ["-p", "continue", "--resume", session.id]
     : ["-p", `/implement #${ticket.number}${context && `\n\n${context}`}`, "--session-id", session.id];
+  // Non-ui tickets run without the design plugin, so its Stop "design deep pass"
+  // hook and agents don't burn tokens on backend work. Both install ids: this
+  // marketplace's and impeccable's own, if that is installed too.
+  const design = ticket.labels.includes("ui") ? [] : ["--settings", JSON.stringify({ enabledPlugins: DESIGN_OFF })];
   // Headless -p denies anything needing approval unless a mode is set.
-  // Seam: #11 adds `--settings` from the ticket's `ui` label here.
-  return [...start, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
+  return [...start, ...design, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
 }
 
 // ── Checks and PRs ─────────────────────────────────────────────────────────
@@ -144,11 +151,28 @@ export function checks(out: { code: number; stdout: string; stderr: string }): C
   return "pass";
 }
 
-/** Body of the draft spec/<N> → main PR. Merging it closes the spec and its tickets. */
-export function specPrBody(spec: { number: number; url: string }, tickets: Ticket[]): string {
+/** Body of the spec/<N> → main PR. Merging it closes the spec and its tickets. */
+export function specPrBody(spec: { number: number; url: string }, tickets: Ticket[], unresolved: string[] = []): string {
   const list = tickets.map((t) => `- [${t.open ? " " : "x"}] #${t.number} ${t.title}`);
   const closes = [spec.number, ...tickets.map((t) => t.number)].map((n) => `#${n}`).join(", ");
-  return [`Spec: ${spec.url}`, "", "Tickets:", ...list, "", `Closes ${closes}`, ""].join("\n");
+  const findings = unresolved.length ? ["Unresolved review findings:", ...unresolved.map((f) => `- ${f}`), ""] : [];
+  return [`Spec: ${spec.url}`, "", "Tickets:", ...list, "", ...findings, `Closes ${closes}`, ""].join("\n");
+}
+
+// The final review: one child, two turns. The second turn fixes what the first found.
+export const FIX_PROMPT =
+  "Fix the findings from your review on this branch: commit each fix and run the tests; don't push. " +
+  "End your reply with a line `Unresolved findings:` followed by one `- ` bullet per finding you couldn't fix, or `None`.";
+
+/** Findings the review child couldn't fix, from its final reply. */
+export function unresolvedFindings(reply: string): string[] {
+  const at = reply.lastIndexOf("Unresolved findings:");
+  if (at < 0) return [];
+  return reply
+    .slice(at)
+    .split("\n")
+    .slice(1)
+    .flatMap((l) => l.match(/^\s*[-*] (.+)$/)?.[1].trim() ?? []);
 }
 
 export type Merged = { ticket: Ticket; pr: number };
@@ -296,9 +320,11 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     }
   }
 
-  if (tickets.some((t) => !t.open)) await ensureSpecPr();
+  const pr = tickets.some((t) => !t.open) ? await ensureSpecPr() : null;
+  const done = tickets.every((t) => !t.open);
+  const reviewed = done && pr ? await reviewSpec(pr) : true;
   say(summary(merged, stuck, tickets));
-  return tickets.every((t) => !t.open) ? 0 : 1;
+  return done && reviewed ? 0 : 1;
 
   // ── Steps ──
 
@@ -397,13 +423,59 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     return true;
   }
 
-  /** Draft spec/<N> → main, opened after the first merge. Seam: #12 reviews it and marks it ready. */
-  async function ensureSpecPr() {
-    const out = await must("gh", ["pr", "list", "--head", specBranch, "--base", main, "--state", "open", "--json", "number"]);
-    if (JSON.parse(out).length) return;
+  type SpecPr = { number: number; state: string; isDraft: boolean };
+
+  /** Draft spec/<N> → main, opened after the first merge. Any state counts, so a merged one isn't reopened. */
+  async function ensureSpecPr(): Promise<SpecPr> {
+    const out = await must("gh", ["pr", "list", "--head", specBranch, "--base", main, "--state", "all", "--json", "number,state,isDraft"]);
+    const found: SpecPr[] = JSON.parse(out);
+    if (found.length) return found[0];
     const body = specPrBody({ number: spec, url: specIssue.url }, tickets);
-    await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", `Spec #${spec}: ${specIssue.title}`, "--body", body]);
+    const url = await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", `Spec #${spec}: ${specIssue.title}`, "--body", body]);
     say(`Opened draft PR ${specBranch} → ${main}`);
+    return { number: Number(url.match(/\/pull\/(\d+)/)![1]), state: "OPEN", isDraft: true };
+  }
+
+  /**
+   * All tickets closed: one `/code-review` child on spec/<N> fixes what it can, the rest goes in
+   * the PR body, then the PR is marked ready. Ready (or merged) means reviewed, so a rerun skips it;
+   * an interrupted review resumes from its log. False if the review child failed.
+   */
+  async function reviewSpec(pr: SpecPr): Promise<boolean> {
+    if (pr.state !== "OPEN" || !pr.isDraft) return true;
+    const dir = join(repo, ".worktrees", `spec-${spec}`);
+    const log = join(repo, ".worktrees/logs", `spec-${spec}-review.jsonl`);
+    const read = () => (existsSync(log) ? readFileSync(log, "utf8") : "");
+    const turns = [`/code-review ${specBranch}`, FIX_PROMPT];
+    await must("git", ["fetch", "origin"]);
+    if (!existsSync(dir)) await must("git", ["worktree", "add", "--detach", dir, `origin/${specBranch}`]);
+    mkdirSync(dirname(log), { recursive: true });
+
+    // Turns done = successful results in the log; a failed or killed turn is sent again.
+    const results = () =>
+      read().trim().split("\n").flatMap((l) => (l.includes('"type":"result"') ? [JSON.parse(l)] : [])).filter((r) => !r.is_error);
+    const self: Ticket = { number: spec, title: specIssue.title, url: specIssue.url, open: true, assignees: [], labels: [], blockedBy: 0 };
+    for (let turn = results().length; turn < turns.length; turn = results().length) {
+      const id = sessionOf(read());
+      say(`${specBranch}: ${turn ? "fixing review findings" : "reviewing"} in ${dir}`);
+      const args = claudeArgs(self, id ? { id, resume: true } : { id: randomUUID(), resume: false });
+      args[1] = turns[turn]; // same flags as a ticket child, the review's own prompt
+      const out = await exec("claude", args, { cwd: dir, log });
+      const why = failure(out.code, read());
+      if (why) {
+        say(`${specBranch}: review stopped: ${why}, log ${log}; the PR stays draft, rerun to resume`);
+        return false;
+      }
+    }
+
+    const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..HEAD`], dir));
+    if (ahead) await must("git", ["push", "origin", `HEAD:refs/heads/${specBranch}`], dir);
+    const unresolved = unresolvedFindings(results().at(-1)?.result ?? "");
+    await must("gh", ["pr", "edit", String(pr.number), "--body", specPrBody({ number: spec, url: specIssue.url }, tickets, unresolved)]);
+    await must("gh", ["pr", "ready", String(pr.number)]);
+    await sh("git", ["worktree", "remove", "--force", dir]);
+    say(`${specBranch}: reviewed (${ahead} fix commit(s), ${unresolved.length} unresolved); PR #${pr.number} ready`);
+    return true;
   }
 
   /**
@@ -423,10 +495,11 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
-/** `runner clean`: removes the ticket worktrees left in .worktrees/ (kept on needs-human). Logs stay. */
+/** `runner clean`: removes the worktrees left in .worktrees/ (tickets kept on needs-human, spec reviews). Logs stay. */
 export async function clean(repo: string, deps: Deps): Promise<number> {
   const root = join(repo, ".worktrees");
-  const dirs = existsSync(root) ? readdirSync(root).filter((d) => /^\d+$/.test(d)).sort((a, b) => Number(a) - Number(b)) : [];
+  const ours = (d: string) => /^(spec-)?\d+$/.test(d);
+  const dirs = existsSync(root) ? readdirSync(root).filter(ours).sort((a, b) => a.localeCompare(b, "en", { numeric: true })) : [];
   for (const d of dirs) {
     const out = await deps.exec("git", ["worktree", "remove", "--force", join(root, d)], { cwd: repo });
     deps.say(out.code === 0 ? `Removed .worktrees/${d}` : `Couldn't remove .worktrees/${d}: ${out.stderr.trim()}`);
