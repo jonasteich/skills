@@ -401,6 +401,21 @@ test("run: removing needs-human retries the ticket fresh, with Jonas's answer as
   assert.equal(gh.issues.get(2)!.state, "closed");
 });
 
+test("run: a retried ticket whose PR is still open pushes to that PR instead of opening another", async () => {
+  const gh = fakeRepo({
+    issues: [open(2)],
+    prs: [{ number: 50, head: "ticket/2", base: "spec/1", state: "open" }],
+    logs: { 2: `{"type":"system","subtype":"init","session_id":"old-session"}\n{"type":"result","subtype":"success","is_error":false,"result":"Done."}\n` },
+    specBranch: true,
+  });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+
+  assert.equal(gh.calls.filter((c) => c.line.startsWith("claude -p /implement #2")).length, 1, "retried fresh");
+  assert.equal(at(gh.calls, "gh pr create --base spec/1"), -1, "no second ticket PR");
+  assert.equal(gh.prs.find((p) => p.number === 50)!.state, "merged");
+  assert.equal(gh.issues.get(2)!.state, "closed");
+});
+
 test("clean: removes leftover ticket worktrees, keeps the logs", async () => {
   const gh = fakeRepo({ issues: [], logs: { 2: "{}\n", 10: "{}\n", "spec-1": "{}\n" } });
   assert.equal(await clean(gh.repo, deps(gh.exec)), 0);

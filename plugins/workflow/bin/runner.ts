@@ -486,10 +486,14 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..${branch(t)}`], worktree(t)));
     if (!ahead) return giveUp(t, NO_COMMIT);
     await must("git", ["push", "-u", "origin", branch(t)], worktree(t));
-    const body = `Ticket #${t.number} for spec #${spec}, built by the runner. The runner merges it and closes #${t.number}.`;
-    const url = await must("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]);
-    const pr = Number(url.match(/\/pull\/(\d+)/)![1]);
-    say(`#${t.number}: opened PR #${pr}`);
+    // A retry after a CI failure or a conflict pushes to the PR it already has.
+    let pr = (await openTicketPrs()).get(t.number);
+    if (pr === undefined) {
+      const body = `Ticket #${t.number} for spec #${spec}, built by the runner. The runner merges it and closes #${t.number}.`;
+      const url = await must("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]);
+      pr = Number(url.match(/\/pull\/(\d+)/)![1]);
+      say(`#${t.number}: opened PR #${pr}`);
+    } else say(`#${t.number}: pushed to PR #${pr}`);
     waiting.set(t.number, { ticket: t, pr, misses: 0 });
   }
 
