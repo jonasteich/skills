@@ -34,6 +34,16 @@
         "./engineering/retro",
         "./productivity/writing-for-agents"
       ]
+    },
+    {
+      "name": "workflow",
+      "source": "./plugins/workflow/skills",
+      "description": "Jonas Teichrüb's own workflow tooling: /workflow-retro turns skill-chain friction into issues.",
+      "category": "productivity",
+      "strict": false,
+      "skills": [
+        "./workflow-retro"
+      ]
     }
   ]
 }

@@ -104,3 +104,40 @@ test("upstream plugin.json is left in place with its own full list", () => {
   assert.equal(upstream.name, "mattpocock-skills");
   assert.ok(upstream.skills.includes("./skills/engineering/ask-matt"));
 });
+
+// workflow is our own plugin (no upstream): it registers every skill it
+// ships, has no plugin.json, and carries its own MIT license.
+const KEPT_WORKFLOW = ["workflow-retro"].map((s) => `./${s}`);
+
+test("workflow is a non-strict entry over its own skills dir", () => {
+  const wf = plugin("workflow");
+  assert.ok(wf, "workflow plugin missing");
+  assert.equal(wf.source, "./plugins/workflow/skills");
+  assert.equal(wf.strict, false);
+  assert.ok(!existsSync(join(root, "plugins/workflow/.claude-plugin")), "own plugin.json");
+});
+
+test("workflow registers exactly the skills it ships", () => {
+  const source = join(root, plugin("workflow").source);
+  const shipped = readdirSync(source, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && existsSync(join(source, d.name, "SKILL.md")))
+    .map((d) => `./${d.name}`);
+  assert.deepEqual([...plugin("workflow").skills].sort(), [...KEPT_WORKFLOW].sort());
+  assert.deepEqual(shipped.sort(), [...KEPT_WORKFLOW].sort());
+});
+
+test("installed workflow copy carries its MIT license", () => {
+  const license = readFileSync(join(root, plugin("workflow").source, "LICENSE"), "utf8");
+  assert.match(license, /^MIT License/);
+  assert.match(license, /Copyright \(c\) \d{4} Jonas Teichrüb/);
+  assert.equal(license, readFileSync(join(root, "plugins/workflow/LICENSE"), "utf8"));
+});
+
+test("workflow-retro is user-invoked", () => {
+  const skill = readFileSync(
+    join(root, plugin("workflow").source, "workflow-retro/SKILL.md"),
+    "utf8",
+  );
+  assert.match(skill, /^---\nname: workflow-retro\n/);
+  assert.match(skill, /\ndisable-model-invocation: true\n/);
+});
