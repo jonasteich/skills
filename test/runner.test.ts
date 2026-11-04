@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, write
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checks, children, frontier, refusal, run, summary } from "../plugins/workflow/bin/runner.ts";
+import { checks, children, claudeArgs, frontier, refusal, run, summary } from "../plugins/workflow/bin/runner.ts";
 import type { Exec } from "../plugins/workflow/bin/runner.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -233,4 +233,20 @@ test("run: refuses before touching GitHub", async () => {
   const gh = fakeRepo({ issues: [open(2)], ci: false });
   assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 2);
   assert.deepEqual(gh.calls, []);
+});
+
+const ticket = (labels: string[]) => ({ number: 3, title: "t", url: "u", open: true, assignees: [], labels, blockedBy: 0 });
+const settings = (args: string[]) => (args.includes("--settings") ? JSON.parse(args[args.indexOf("--settings") + 1]) : null);
+
+test("claudeArgs: non-ui tickets run with the design plugin off", () => {
+  for (const session of [{ id: "s", resume: false }, { id: "s", resume: true }]) {
+    assert.deepEqual(settings(claudeArgs(ticket(["ready-for-agent"]), session)), {
+      enabledPlugins: { "design@skills": false, "impeccable@impeccable": false },
+    });
+  }
+});
+
+test("claudeArgs: ui tickets run with the design plugin as installed", () => {
+  assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: false })), null);
+  assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: true })), null);
 });
