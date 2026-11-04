@@ -62,9 +62,40 @@ test("prototype: UI branch keeps throwaway, ?variant= and capture rules", () => 
   assert.match(skill("prototype"), /Throwaway from day one/);
 });
 
+test("setup: Section D writes docs/agents/design.md and creates the ui label", () => {
+  const text = skill("setup");
+  assert.match(text, /\*\*Section D: Design docs\.\*\*/);
+  assert.match(text, /docs\/agents\/design\.md/);
+  assert.match(text, /gh label create ui/);
+  assert.match(text, /### Design docs/, "Agent skills block entry missing");
+  const seed = file("setup/design.md");
+  for (const doc of ["DESIGN.md", "PRODUCT.md", "/impeccable init", "/impeccable document"])
+    assert.ok(seed.includes(doc), `design.md seed missing ${doc}`);
+});
+
+test("setup: tracker menu unchanged", () => {
+  const text = skill("setup");
+  for (const t of ["**GitHub**", "**GitLab**", "**Local markdown**", "**Other**"])
+    assert.ok(text.includes(t), t);
+});
+
+test("to-spec, to-tickets and implement read design docs for UI work", () => {
+  for (const s of ["to-spec", "to-tickets", "implement"])
+    assert.match(skill(s), /UI work.*`docs\/agents\/design\.md`/, s);
+});
+
+test("to-tickets labels user-visible tickets ui, as a frontmatter tag locally", () => {
+  const text = skill("to-tickets");
+  assert.match(text, /`ui` label.*changes something a user sees/);
+  assert.match(text, /labels: \[ui\]/);
+});
+
 test("each wiring edit is logged in CHANGES.md with why and upstream tag", () => {
-  for (const s of ["wayfinder", "to-spec", "grill-with-docs", "triage", "prototype"]) {
-    const entry = changes.split(/^### /m).find((e) => e.startsWith(`${s}:`));
+  for (const s of [
+    "wayfinder:", "to-spec:", "grill-with-docs:", "triage:", "prototype:",
+    "setup: Section D", "to-spec, to-tickets, implement:", "to-tickets: apply `ui`",
+  ]) {
+    const entry = changes.split(/^### /m).find((e) => e.startsWith(s));
     assert.ok(entry, `${s} entry missing`);
     assert.match(entry, /\*\*Why\*\*/, s);
     assert.match(entry, /\*\*Upstream tag\*\*: `v1\.3\.1`/, s);
