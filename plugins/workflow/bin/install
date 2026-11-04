@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# install: symlink the fleet's scripts (sync, runner) into ~/.local/bin, so they
-# run from any repo. Rerun after adding a script; a missing one is skipped.
+# install: symlink the fleet's scripts (sync, runner) from this clone into
+# ~/.local/bin (override with BIN_DIR), so they run from any repo. Rerun after
+# adding a script; a missing one is skipped.
 set -euo pipefail
 
 here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-target=$HOME/.local/bin
+target=${BIN_DIR:-$HOME/.local/bin}
 mkdir -p "$target"
 
 for name in sync runner; do
@@ -18,4 +19,4 @@ for name in sync runner; do
   echo "install: $link -> $here/$name"
 done
 
-case ":$PATH:" in *":$target:"*) ;; *) echo "install: add $target to your PATH" ;; esac
+case ":$PATH:" in *":$target:"*) ;; *) echo "install: $target is not on PATH; add it" ;; esac
