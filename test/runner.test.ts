@@ -476,6 +476,14 @@ test("claudeArgs: ui tickets run with the design plugin as installed", () => {
   assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: true })), null);
 });
 
+test("claudeArgs: child logs record hook events, so a log shows whether the design Stop hook ran", () => {
+  for (const labels of [["ui"], []]) {
+    for (const session of [{ id: "s", resume: false }, { id: "s", resume: true }]) {
+      assert.ok(claudeArgs(ticket(labels), session).includes("--include-hook-events"));
+    }
+  }
+});
+
 // ── Final review ────────────────────────────────────────────────────────────
 
 test("run: once every ticket is closed, reviews spec/<N> once, fixes it there and marks the PR ready", async () => {

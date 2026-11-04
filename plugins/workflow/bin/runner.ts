@@ -190,7 +190,9 @@ export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolea
   // marketplace's and impeccable's own, if that is installed too.
   const design = ticket.labels.includes("ui") ? [] : ["--settings", JSON.stringify({ enabledPlugins: DESIGN_OFF })];
   // Headless -p denies anything needing approval unless a mode is set.
-  return [...start, ...design, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
+  // Hook events in the log show whether the design Stop hook ran.
+  const stream = ["--output-format", "stream-json", "--verbose", "--include-hook-events"];
+  return [...start, ...design, ...stream, "--permission-mode", "auto", "--permission-prompts", "none"];
 }
 
 // ── Checks and PRs ─────────────────────────────────────────────────────────
