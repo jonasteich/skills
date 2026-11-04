@@ -113,14 +113,19 @@ export function failure(code: number, log: string): string | null {
   return null;
 }
 
+const DESIGN_OFF = { "design@skills": false, "impeccable@impeccable": false };
+
 /** Arguments for a fresh child, or for resuming one whose session already exists. */
 export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean }): string[] {
   const start = session.resume
     ? ["-p", "continue", "--resume", session.id]
     : ["-p", `/implement #${ticket.number}`, "--session-id", session.id];
+  // Non-ui tickets run without the design plugin, so its Stop "design deep pass"
+  // hook and agents don't burn tokens on backend work. Both install ids: this
+  // marketplace's and impeccable's own, if that is installed too.
+  const design = ticket.labels.includes("ui") ? [] : ["--settings", JSON.stringify({ enabledPlugins: DESIGN_OFF })];
   // Headless -p denies anything needing approval unless a mode is set.
-  // Seam: #11 adds `--settings` from the ticket's `ui` label here.
-  return [...start, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
+  return [...start, ...design, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"];
 }
 
 // ── Checks and PRs ─────────────────────────────────────────────────────────
