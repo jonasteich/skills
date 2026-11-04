@@ -114,9 +114,9 @@ export function failure(code: number, log: string): string | null {
 }
 
 /** Arguments for a fresh child, or for resuming one whose session already exists. */
-export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean }): string[] {
+export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean; prompt?: string }): string[] {
   const start = session.resume
-    ? ["-p", "continue", "--resume", session.id]
+    ? ["-p", session.prompt ?? "continue", "--resume", session.id]
     : ["-p", `/implement #${ticket.number}`, "--session-id", session.id];
   // Headless -p denies anything needing approval unless a mode is set.
   // Seam: #11 adds `--settings` from the ticket's `ui` label here.
@@ -187,6 +187,33 @@ export const realExec: Exec = (cmd, args, opts = {}) =>
     });
   });
 
+// ── Updating a ticket branch from spec/<N> ─────────────────────────────────
+
+export type Update = { status: "current" | "merged" } | { status: "conflict"; files: string[] } | { status: "failed"; why: string };
+
+/** Merges the fetched spec/<N> tip into the branch checked out at `dir`. A conflict stays in place to resolve. */
+export async function updateFromSpec(exec: Exec, dir: string, specBranch: string): Promise<Update> {
+  const tip = `origin/${specBranch}`;
+  if ((await exec("git", ["merge-base", "--is-ancestor", tip, "HEAD"], { cwd: dir })).code === 0) return { status: "current" };
+  const out = await exec("git", ["merge", "--no-edit", tip], { cwd: dir });
+  if (out.code === 0) return { status: "merged" };
+  const files = await conflicted(exec, dir);
+  return files.length ? { status: "conflict", files } : { status: "failed", why: `git merge ${tip} failed: ${out.stderr.trim()}` };
+}
+
+/** Why the merge in `dir` isn't done yet, or null once it's committed with no conflicts left. */
+export async function unresolved(exec: Exec, dir: string): Promise<string | null> {
+  const files = await conflicted(exec, dir);
+  if (files.length) return `still conflicted: ${files.join(", ")}`;
+  const merging = (await exec("git", ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { cwd: dir })).code === 0;
+  return merging ? "merge not committed" : null;
+}
+
+async function conflicted(exec: Exec, dir: string): Promise<string[]> {
+  const out = await exec("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: dir });
+  return out.stdout.split("\n").filter(Boolean);
+}
+
 export type Deps = { exec: Exec; sleep: (ms: number) => Promise<unknown>; say: (msg: string) => void };
 export type Options = { spec: number; repo: string; ci: boolean; concurrency: number };
 
@@ -250,6 +277,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
 
     if (running.size === 0 && waiting.size === 0) break;
     if (await pollWaiting()) continue; // a merge may have unblocked tickets
+    if (running.size === 0 && waiting.size === 0) continue; // the last waiting PR got stuck: nothing left to wait on
 
     // React as soon as a child exits; wake for the next CI poll only if a PR is waiting.
     const poll = waiting.size ? deps.sleep(POLL_MS).then(() => null) : new Promise<null>(() => {});
@@ -320,14 +348,51 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   async function pollWaiting(): Promise<boolean> {
     let any = false;
     for (const w of [...waiting.values()]) {
-      // Seam: #9 updates the ticket branch from the spec/<N> tip (and resolves conflicts) here.
       const state = ci ? checks(await sh("gh", ["pr", "checks", String(w.pr), "--json", "name,bucket"])) : "pass";
       if (state === "pending" || (state === "none" && ++w.misses < NO_CHECKS_GRACE)) continue;
       waiting.delete(w.ticket.number);
-      if (state === "pass") any = (await merge(w.ticket, w.pr)) || any;
-      else giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
+      if (state !== "pass") {
+        giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
+        continue;
+      }
+      const update = await updateTicket(w.ticket);
+      if (update === "stuck") continue;
+      // The updated branch needs green CI again before it merges.
+      if (update === "pushed" && ci) waiting.set(w.ticket.number, { ...w, misses: 0 });
+      else any = (await merge(w.ticket, w.pr)) || any;
     }
     return any;
+  }
+
+  /** Brings the ticket branch up to the spec/<N> tip; a conflict goes back to the child's own session, once. */
+  async function updateTicket(t: Ticket): Promise<"current" | "pushed" | "stuck"> {
+    const dir = worktree(t);
+    await must("git", ["fetch", "origin"]);
+    if (!existsSync(dir)) await must("git", ["worktree", "add", "-B", branch(t), dir, `origin/${branch(t)}`]);
+    const update = await updateFromSpec(exec, dir, specBranch);
+    if (update.status === "current") return "current";
+    const why = update.status === "failed" ? update.why : update.status === "conflict" ? await resolveConflict(t, update.files) : null;
+    if (why) {
+      giveUp(t, why);
+      return "stuck";
+    }
+    await must("git", ["push", "origin", branch(t)], dir);
+    say(`#${t.number}: updated ${branch(t)} from ${specBranch}`);
+    return "pushed";
+  }
+
+  /** Resumes the ticket's session to resolve the conflicted merge and rerun tests. Why it didn't, or null. */
+  async function resolveConflict(t: Ticket, files: string[]): Promise<string | null> {
+    const log = () => (existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "");
+    const id = sessionOf(log());
+    const conflict = `merging ${specBranch} into ${branch(t)} conflicted in ${files.join(", ")}`;
+    if (!id) return `${conflict}, and there's no session to resume`;
+    say(`#${t.number}: ${conflict}; resuming claude to resolve it`);
+    const prompt = `Merging origin/${specBranch} into this branch conflicted in: ${files.join(", ")}. ` +
+      "Resolve the conflicts so both sides' changes still work, rerun the tests until they pass, and commit the merge.";
+    const out = await exec("claude", claudeArgs(t, { id, resume: true, prompt }), { cwd: worktree(t), log: logOf(t) });
+    const why = failure(out.code, log()) ?? (await unresolved(exec, worktree(t)));
+    return why && `${conflict}, still failing after the resumed session: ${why}`;
   }
 
   async function merge(t: Ticket, pr: number): Promise<boolean> {
