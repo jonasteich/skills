@@ -28,3 +28,17 @@ Then refresh `skills/LICENSE` from the subtree's `LICENSE`, update the pinned ta
 - Log every edit in that plugin's `CHANGES.md`: one entry per edit with skill, what, why, upstream tag.
 - **Apache-2.0 upstreams:** every modified file gets `<!-- Modified by Jonas Teichrüb, see CHANGES.md -->` at the top, and the upstream `LICENSE` and `NOTICE` stay in place. MIT upstreams: keep the `LICENSE`.
 - No own hooks or agents, no personal dotfiles, no personal CLAUDE.md in this repo.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on jonasteich/skills, via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five: needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
