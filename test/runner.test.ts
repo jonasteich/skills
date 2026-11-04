@@ -6,7 +6,8 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readd
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checks, children, claudeArgs, clean, frontier, realExec, refusal, run, summary, unresolvedFindings, updateFromSpec, usageLimit, LIMIT_FALLBACK_MS } from "../plugins/workflow/bin/runner.ts";
+import { answers, checks, children, claudeArgs, clean, frontier, realExec, refusal, run, summary, unresolvedFindings, updateFromSpec, usageLimit, LIMIT_FALLBACK_MS } from "../plugins/workflow/bin/runner.ts";
+import { NEEDS_HUMAN_MARK } from "../plugins/workflow/bin/runner.ts";
 import type { Exec } from "../plugins/workflow/bin/runner.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -498,29 +499,29 @@ test("run: a conflict still failing after the resumed session leaves the ticket 
   assert.equal(at(gh.calls, `worktree remove --force ${join(gh.repo, ".worktrees/3")}`), -1, "worktree kept for inspection");
   assert.equal(gh.issues.get(2)!.state, "closed");
   assert.equal(gh.issues.get(3)!.state, "open");
-  assert.ok(said.some((m) => /#3: stuck: merging spec\/1 into ticket\/3 conflicted in f\.txt, still failing/.test(m)), said.join("\n"));
+  assert.ok(said.some((m) => /#3: stuck: merging spec\/1 into ticket\/3 conflicted in f\.txt, still unresolved/.test(m)), said.join("\n"));
 });
 
-const ticket = (labels: string[]) => ({ number: 3, title: "t", url: "u", open: true, assignees: [], labels, blockedBy: 0 });
+const prompt = (labels: string[]) => ({ text: "/implement #3", ui: labels.includes("ui") });
 const settings = (args: string[]) => (args.includes("--settings") ? JSON.parse(args[args.indexOf("--settings") + 1]) : null);
 
-test("claudeArgs: non-ui tickets run with the design plugin off", () => {
+test("claudeArgs: non-ui work runs with the design plugin off", () => {
   for (const session of [{ id: "s", resume: false }, { id: "s", resume: true }]) {
-    assert.deepEqual(settings(claudeArgs(ticket(["ready-for-agent"]), session)), {
+    assert.deepEqual(settings(claudeArgs(prompt(["ready-for-agent"]), session)), {
       enabledPlugins: { "design@skills": false, "impeccable@impeccable": false },
     });
   }
 });
 
-test("claudeArgs: ui tickets run with the design plugin as installed", () => {
-  assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: false })), null);
-  assert.equal(settings(claudeArgs(ticket(["ui"]), { id: "s", resume: true })), null);
+test("claudeArgs: ui work runs with the design plugin as installed", () => {
+  assert.equal(settings(claudeArgs(prompt(["ui"]), { id: "s", resume: false })), null);
+  assert.equal(settings(claudeArgs(prompt(["ui"]), { id: "s", resume: true })), null);
 });
 
 test("claudeArgs: child logs record hook events, so a log shows whether the design Stop hook ran", () => {
   for (const labels of [["ui"], []]) {
     for (const session of [{ id: "s", resume: false }, { id: "s", resume: true }]) {
-      assert.ok(claudeArgs(ticket(labels), session).includes("--include-hook-events"));
+      assert.ok(claudeArgs(prompt(labels), session).includes("--include-hook-events"));
     }
   }
 });
@@ -534,7 +535,7 @@ test("run: once every ticket is closed, reviews spec/<N> once, fixes it there an
   const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
   const review = claude.filter((c) => c.cwd === join(gh.repo, ".worktrees/spec-1"));
   assert.equal(review.length, 2, "one review turn, one fix turn");
-  assert.match(review[0].line, /^claude -p \/code-review spec\/1 --session-id ([0-9a-f-]{36}) /);
+  assert.match(review[0].line, /^claude -p \/code-review origin\/main --session-id ([0-9a-f-]{36}) /);
   const id = review[0].line.match(/--session-id (\S+)/)![1];
   assert.match(review[1].line, new RegExp(`^claude -p .*Unresolved findings:.* --resume ${id} `), "fixes in the same child");
   assert.ok(at(gh.calls, "gh issue close 2") < gh.calls.indexOf(review[0]), "reviewed before the last ticket closed");
@@ -682,8 +683,8 @@ test("run: a review child on a usage limit waits for the reset and resumes, the 
 
   const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
   const id = claude[0].line.match(/--session-id (\S+)/)![1];
-  assert.match(claude[1].line, new RegExp(`^claude -p /code-review spec/1 --resume ${id} `), "review turn sent again in its session");
-  assert.deepEqual(clock.slept, [Date.UTC(2026, 10, 4, 11, 40) - NOW]);
+  assert.match(claude[1].line, new RegExp(`^claude -p /code-review origin/main --resume ${id} `), "review turn sent again in its session");
+  assert.equal(clock.slept[0], Date.UTC(2026, 10, 4, 11, 40) - NOW);
   assert.equal(gh.prs[0].draft, false);
 });
 
@@ -706,4 +707,95 @@ test("run: a conflict-resolving child on a usage limit waits for the reset and r
   assert.ok(clock.slept.includes(Date.UTC(2026, 10, 4, 11, 40) - NOW), `slept ${clock.slept}`);
   assert.equal(at(gh.calls, "needs-human"), -1);
   assert.equal(gh.issues.get(3)!.state, "closed");
+});
+
+// ── Review findings (spec/1 code review) ──
+
+const res = (code: number, stdout = "", stderr = "") => Promise.resolve({ code, stdout, stderr });
+
+test("run: review fixes on spec/<N> wait for the spec PR's CI before it gets ready", async () => {
+  const gh = fakeRepo({ issues: [closed(2)], specBranch: true, prs: [specPr(true)] });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+  const push = at(gh.calls, "git push origin HEAD:refs/heads/spec/1");
+  const checked = gh.calls.findIndex((c, i) => i > push && c.line.startsWith("gh pr checks 90"));
+  assert.ok(push >= 0 && checked > push, "spec PR checks not read after the push");
+  assert.ok(at(gh.calls, "gh pr ready 90") > checked);
+});
+
+test("run: review fixes failing the spec PR's CI leave it draft", async () => {
+  const fail = JSON.stringify([{ name: "test", bucket: "fail" }]);
+  const said: string[] = [];
+  const gh = fakeRepo({
+    issues: [closed(2)], specBranch: true, prs: [specPr(true)],
+    override: (line) => (line.startsWith("gh pr checks 90") ? res(1, fail) : undefined),
+  });
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, { ...deps(gh.exec), say: (m: string) => said.push(m) }), 1);
+  assert.equal(gh.prs[0].draft, true);
+  assert.equal(at(gh.calls, "gh pr ready"), -1);
+  assert.ok(said.some((m) => /spec\/1: .*CI failed on PR #90/.test(m)), said.join("\n"));
+});
+
+test("run: the review child gets the design plugin when any ticket of the spec is ui", async () => {
+  for (const [labels, off] of [[["ui"], false], [[], true]] as const) {
+    const gh = fakeRepo({ issues: [{ ...closed(2), labels: [...labels] }, closed(3)], specBranch: true, prs: [specPr(true)] });
+    await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+    const review = gh.calls.filter((c) => c.line.startsWith("claude "));
+    assert.equal(review.length, 2);
+    for (const c of review) assert.equal(c.line.includes("--settings"), off, `labels ${labels}`);
+  }
+});
+
+test("answers: every human comment since the runner first stopped, without its own comments", () => {
+  const comments = ["Earlier chatter", `${NEEDS_HUMAN_MARK}\nfirst stop`, "Orange.", `${NEEDS_HUMAN_MARK}\nsecond stop`, "And bold."];
+  assert.equal(answers(JSON.stringify({ comments: comments.map((body) => ({ body })) })), "Orange.\n\n---\n\nAnd bold.");
+});
+
+test("run: a retry resets the stale local ticket branch to its pushed one, else to the spec/<N> tip", async () => {
+  for (const pushed of [true, false]) {
+    const gh = fakeRepo({
+      issues: [{ ...open(2), comments: [`${NEEDS_HUMAN_MARK}\nstuck`, "Go on."] }],
+      logs: { 2: `{"type":"system","subtype":"init","session_id":"old"}\n{"type":"result","subtype":"success","is_error":false}\n` },
+      specBranch: true,
+      override: (line) => (line.includes("rev-parse --verify --quiet refs/remotes/origin/ticket/2") ? res(pushed ? 0 : 1) : undefined),
+    });
+    await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+    const reset = at(gh.calls, `git branch -f ticket/2 ${pushed ? "origin/ticket/2" : "origin/spec/1"}`);
+    assert.ok(reset > at(gh.calls, "git worktree remove"), `pushed=${pushed}: branch not reset after removing the worktree`);
+    assert.ok(reset < at(gh.calls, "git worktree add"), `pushed=${pushed}: branch reset after the worktree was added`);
+  }
+});
+
+/** --no-ci: #3's branch is behind spec/1 once #2 merges and merges it cleanly; `passes`: its tests rerun green. */
+function behindNoCi(passes: boolean) {
+  return fakeRepo({
+    issues: [open(2), open(3)], ci: false,
+    override: (line, o, prs) => {
+      const in3 = o.cwd?.endsWith(".worktrees/3");
+      if (line.startsWith("git merge-base --is-ancestor")) return res(in3 && prs.some((p) => p.head === "ticket/2" && p.state === "merged") ? 1 : 0);
+      if (line.startsWith("claude ") && line.includes("--resume")) {
+        const id = line.match(/--resume (\S+)/)![1];
+        const end = passes ? `"subtype":"success","is_error":false` : `"subtype":"error_during_execution","is_error":true`;
+        appendFileSync(o.log!, `{"type":"system","subtype":"init","session_id":"${id}"}\n{"type":"result",${end},"session_id":"${id}"}\n`);
+        return res(passes ? 0 : 1);
+      }
+      return undefined;
+    },
+  });
+}
+
+test("run --no-ci: a branch updated from spec/<N> reruns its tests in the child's session before it merges", async () => {
+  const gh = behindNoCi(true);
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: false, concurrency: 2 }, deps(gh.exec)), 0);
+  const retest = gh.calls.findIndex((c) => c.line.startsWith("claude ") && c.line.includes("--resume") && c.cwd?.endsWith(".worktrees/3"));
+  assert.ok(retest >= 0, "no test rerun after the update");
+  assert.match(gh.calls[retest].line, /tests/);
+  assert.ok(at(gh.calls, "gh pr merge 102") > retest);
+  assert.equal(gh.issues.get(3)!.state, "closed");
+});
+
+test("run --no-ci: an updated branch whose tests fail again isn't merged", async () => {
+  const gh = behindNoCi(false);
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: false, concurrency: 2 }, deps(gh.exec)), 1);
+  assert.equal(at(gh.calls, "gh pr merge 102"), -1);
+  assert.deepEqual(gh.issues.get(3)!.labels, ["needs-human"]);
 });
