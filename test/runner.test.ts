@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readd
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checks, children, claudeArgs, clean, frontier, refusal, run, summary, unresolvedFindings } from "../plugins/workflow/bin/runner.ts";
+import { checks, children, claudeArgs, clean, frontier, realExec, refusal, run, summary, unresolvedFindings, updateFromSpec } from "../plugins/workflow/bin/runner.ts";
 import type { Exec } from "../plugins/workflow/bin/runner.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -66,6 +66,63 @@ test("summary: lists merged, stuck and still-open tickets with links", () => {
   );
 });
 
+// ── Updating a ticket branch from spec/<N>, against real git ────────────────
+
+/** An origin with spec/1, and a clone whose ticket/2 branched off it and changed f.txt's first line. */
+async function ticketClone() {
+  const root = mkdtempSync(join(tmpdir(), "runner-git-"));
+  const git = async (cwd: string, ...args: string[]) => {
+    const out = await realExec("git", ["-c", "init.defaultBranch=main", ...args], { cwd });
+    assert.equal(out.code, 0, `git ${args.join(" ")}: ${out.stderr}`);
+  };
+  const clone = async (name: string, ...args: string[]) => {
+    await git(root, "clone", "-q", ...args, "origin.git", name);
+    await git(join(root, name), "config", "user.name", "t");
+    await git(join(root, name), "config", "user.email", "t@t");
+    return join(root, name);
+  };
+  const commit = async (cwd: string, text: string) => {
+    writeFileSync(join(cwd, "f.txt"), text);
+    await git(cwd, "add", ".");
+    await git(cwd, "commit", "-qm", text.trim());
+  };
+  await git(root, "init", "-q", "--bare", "origin.git");
+  const spec = await clone("spec");
+  await commit(spec, "a\nb\nc\n");
+  await git(spec, "push", "-q", "origin", "HEAD:spec/1");
+  const ticket = await clone("ticket", "-b", "spec/1");
+  await git(ticket, "checkout", "-qb", "ticket/2");
+  await commit(ticket, "ticket 2\nb\nc\n");
+  return {
+    ticket,
+    /** Another ticket merges into spec/1, changing f.txt to `text`. */
+    advance: async (text: string) => {
+      await commit(spec, text);
+      await git(spec, "push", "-q", "origin", "HEAD:spec/1");
+      await git(ticket, "fetch", "-q", "origin");
+    },
+  };
+}
+
+test("updateFromSpec: a branch already on the spec/<N> tip stays as it is", async () => {
+  const { ticket } = await ticketClone();
+  assert.deepEqual(await updateFromSpec(realExec, ticket, "spec/1"), { status: "current" });
+});
+
+test("updateFromSpec: merges a spec/<N> tip that touched other lines", async () => {
+  const { ticket, advance } = await ticketClone();
+  await advance("a\nb\nticket 3\n");
+  assert.deepEqual(await updateFromSpec(realExec, ticket, "spec/1"), { status: "merged" });
+  assert.equal(readFileSync(join(ticket, "f.txt"), "utf8"), "ticket 2\nb\nticket 3\n");
+});
+
+test("updateFromSpec: a conflict is left in the worktree, naming the files", async () => {
+  const { ticket, advance } = await ticketClone();
+  await advance("ticket 3\nb\nc\n");
+  assert.deepEqual(await updateFromSpec(realExec, ticket, "spec/1"), { status: "conflict", files: ["f.txt"] });
+  assert.match(readFileSync(join(ticket, "f.txt"), "utf8"), /^<<<<<<< /m);
+});
+
 // ── The loop, against a fake GitHub ─────────────────────────────────────────
 
 type Issue = { number: number; title: string; state: "open" | "closed"; assignees: string[]; labels: string[]; comments?: string[] };
@@ -84,6 +141,8 @@ function fakeRepo(opts: {
   logs?: Record<number | string, string>;
   review?: string; // the review child's final reply
   child?: Record<number, Child>;
+  /** Answers a command before the defaults do; undefined falls through. */
+  override?: (line: string, o: { cwd?: string; log?: string }, prs: Pr[]) => ReturnType<Exec> | undefined;
 }) {
   const repo = mkdtempSync(join(tmpdir(), "runner-"));
   mkdirSync(join(repo, "docs/agents"), { recursive: true });
@@ -109,6 +168,8 @@ function fakeRepo(opts: {
   const exec: Exec = async (cmd, args, o = {}) => {
     const line = [cmd, ...args].join(" ");
     calls.push({ line, cwd: o.cwd });
+    const answer = opts.override?.(line, o, prs);
+    if (answer) return answer;
     const has = (s: string) => line.includes(s);
     const num = (flagged: string) => Number(line.match(new RegExp(`${flagged} (\\d+)`))![1]);
 
@@ -333,6 +394,70 @@ test("clean: removes leftover ticket worktrees, keeps the logs", async () => {
   ]);
   assert.deepEqual(readdirSync(join(gh.repo, ".worktrees")), ["logs"]);
   assert.deepEqual(readdirSync(join(gh.repo, ".worktrees/logs")).sort(), ["10.jsonl", "2.jsonl", "spec-1.jsonl"]);
+});
+
+/**
+ * #2 and #3 touch the same lines: once #2 merges, #3's branch conflicts with spec/1.
+ * `resolves` says whether #3's resumed session clears the conflict.
+ */
+function sameLines(resolves: boolean) {
+  let fixed = false;
+  const res = (code: number, stdout = "", stderr = "") => Promise.resolve({ code, stdout, stderr });
+  return fakeRepo({
+    issues: [open(2), open(3)],
+    override: (line, o, prs) => {
+      const in3 = o.cwd?.endsWith(".worktrees/3");
+      const behind = in3 && prs.some((p) => p.head === "ticket/2" && p.state === "merged");
+      if (line.startsWith("git merge-base --is-ancestor")) return res(behind && !fixed ? 1 : 0);
+      if (line.startsWith("git merge --no-edit") && in3) return res(1, "", "CONFLICT (content)");
+      if (line.startsWith("git diff --name-only --diff-filter=U") && in3 && !fixed) return res(0, "f.txt\n");
+      if (line.startsWith("git rev-parse -q --verify MERGE_HEAD")) return res(1);
+      if (line.startsWith("claude ") && line.includes("--resume")) {
+        fixed = resolves;
+        const id = line.match(/--resume (\S+)/)![1];
+        const end = resolves ? `"subtype":"success","is_error":false` : `"subtype":"error_during_execution","is_error":true`;
+        appendFileSync(o.log!, `{"type":"result",${end},"session_id":"${id}"}\n`);
+        return res(0);
+      }
+      return undefined;
+    },
+  });
+}
+
+test("run: a conflict with spec/<N> is resolved in the child's own session, then merged", async () => {
+  const gh = sameLines(true);
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec)), 0);
+
+  const inTickets = (c: { cwd?: string }) => /\.worktrees\/[23]$/.test(c.cwd ?? ""); // not the spec review
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude ") && inTickets(c));
+  const first = claude[1].line.match(/--session-id (\S+)/)![1];
+  assert.equal(claude.length, 3, "one resolution run, no fresh session");
+  assert.match(claude[2].line, new RegExp(`^claude -p .*conflict.* --resume ${first} `, "s"));
+  assert.match(claude[2].line, /f\.txt/);
+  assert.match(claude[2].line, /tests/);
+  assert.equal(claude[2].cwd, join(gh.repo, ".worktrees/3"));
+
+  const resolved = gh.calls.indexOf(claude[2]);
+  const push = gh.calls.findIndex((c, i) => i > resolved && c.line === "git push origin ticket/3");
+  const recheck = gh.calls.findIndex((c, i) => i > push && c.line.startsWith("gh pr checks 102"));
+  assert.ok(push > 0 && recheck > push, "resolved branch pushed, then CI checked again");
+  assert.ok(at(gh.calls, "gh pr merge 102") > recheck);
+  assert.equal(gh.issues.get(3)!.state, "closed");
+});
+
+test("run: a conflict still failing after the resumed session leaves the ticket stuck, unmerged", async () => {
+  const gh = sameLines(false);
+  const said: string[] = [];
+  const code = await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, { ...deps(gh.exec), say: (m: string) => said.push(m) });
+
+  assert.equal(code, 1);
+  assert.equal(gh.calls.filter((c) => c.line.includes("--resume")).length, 1, "resolution tried once");
+  assert.equal(at(gh.calls, "gh pr merge 102"), -1);
+  assert.equal(at(gh.calls, "git push origin ticket/3"), -1);
+  assert.equal(at(gh.calls, `worktree remove --force ${join(gh.repo, ".worktrees/3")}`), -1, "worktree kept for inspection");
+  assert.equal(gh.issues.get(2)!.state, "closed");
+  assert.equal(gh.issues.get(3)!.state, "open");
+  assert.ok(said.some((m) => /#3: stuck: merging spec\/1 into ticket\/3 conflicted in f\.txt, still failing/.test(m)), said.join("\n"));
 });
 
 const ticket = (labels: string[]) => ({ number: 3, title: "t", url: "u", open: true, assignees: [], labels, blockedBy: 0 });
