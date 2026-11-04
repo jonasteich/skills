@@ -13,7 +13,7 @@
       "category": "engineering",
       "strict": false,
       "skills": [
-        "./engineering/setup-matt-pocock-skills",
+        "./engineering/setup",
         "./engineering/wayfinder",
         "./engineering/grill-with-docs",
         "./productivity/grilling",
@@ -33,6 +33,22 @@
         "./engineering/wizard",
         "./engineering/retro",
         "./productivity/writing-for-agents"
+      ]
+    },
+    {
+      "name": "design",
+      "source": "./plugins/design",
+      "description": "Paul Bakaus's impeccable design skill (pbakaus/impeccable), with its agents and hooks, as shipped.",
+      "category": "design"
+    },
+    {
+      "name": "workflow",
+      "source": "./plugins/workflow/skills",
+      "description": "Jonas Teichrüb's own workflow tooling: /workflow-retro turns skill-chain friction into issues.",
+      "category": "productivity",
+      "strict": false,
+      "skills": [
+        "./workflow-retro"
       ]
     }
   ]

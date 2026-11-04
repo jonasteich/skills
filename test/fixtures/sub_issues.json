@@ -1,0 +1,24 @@
+[
+  [
+    {"number": 2, "title": "Ready ticket", "state": "open", "html_url": "https://github.com/o/r/issues/2",
+     "assignees": [], "labels": [{"name": "ready-for-agent"}],
+     "issue_dependencies_summary": {"blocked_by": 0, "total_blocked_by": 0, "blocking": 1, "total_blocking": 1}},
+    {"number": 3, "title": "Blocked by #2", "state": "open", "html_url": "https://github.com/o/r/issues/3",
+     "assignees": [], "labels": [{"name": "ready-for-agent"}],
+     "issue_dependencies_summary": {"blocked_by": 1, "total_blocked_by": 1, "blocking": 0, "total_blocking": 0}},
+    {"number": 4, "title": "Claimed by a runner", "state": "open", "html_url": "https://github.com/o/r/issues/4",
+     "assignees": [{"login": "jonasteich"}], "labels": [],
+     "issue_dependencies_summary": {"blocked_by": 0, "total_blocked_by": 0, "blocking": 0, "total_blocking": 0}}
+  ],
+  [
+    {"number": 5, "title": "Already done", "state": "closed", "html_url": "https://github.com/o/r/issues/5",
+     "assignees": [], "labels": [],
+     "issue_dependencies_summary": {"blocked_by": 0, "total_blocked_by": 0, "blocking": 0, "total_blocking": 0}},
+    {"number": 6, "title": "Blocker since closed", "state": "open", "html_url": "https://github.com/o/r/issues/6",
+     "assignees": [], "labels": [{"name": "ui"}],
+     "issue_dependencies_summary": {"blocked_by": 0, "total_blocked_by": 1, "blocking": 0, "total_blocking": 0}},
+    {"number": 7, "title": "Waiting on Jonas", "state": "open", "html_url": "https://github.com/o/r/issues/7",
+     "assignees": [], "labels": [{"name": "needs-human"}],
+     "issue_dependencies_summary": {"blocked_by": 0, "total_blocked_by": 0, "blocking": 0, "total_blocking": 0}}
+  ]
+]

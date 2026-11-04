@@ -43,6 +43,7 @@ State what is out of scope. This prevents the agent from gold-plating or making 
 
 **Category:** bug / enhancement
 **Summary:** one-line description of what needs to happen
+**Start with:** `diagnosing-bugs` (bugs only; omit for enhancements)
 
 **Current behavior:**
 Describe what happens now. For bugs, this is the broken behavior.
@@ -76,6 +77,7 @@ Be specific about edge cases and error conditions.
 
 **Category:** bug
 **Summary:** Skill description truncation drops mid-word, producing broken output
+**Start with:** `diagnosing-bugs`
 
 **Current behavior:**
 When a skill description exceeds 1024 characters, it is truncated at exactly
