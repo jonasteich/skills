@@ -10,6 +10,8 @@ If invoked with a map (a `wayfinder:map` issue, by URL or number), read the map 
 
 The issue tracker and triage label vocabulary should have been provided to you. If not, tell the user to run `/setup`.
 
+For UI work, read the design docs per `docs/agents/design.md`.
+
 ## Process
 
 1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the project's domain glossary vocabulary throughout the spec, and respect any ADRs in the area you're touching.
