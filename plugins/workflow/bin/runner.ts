@@ -582,7 +582,8 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const found: SpecPr[] = JSON.parse(out);
     if (found.length) return found[0];
     const body = specPrBody({ number: spec, url: specIssue.url }, tickets);
-    const url = await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", `Spec #${spec}: ${specIssue.title}`, "--body", body]);
+    const title = `Spec #${spec}: ${specIssue.title.replace(/^Spec:\s*/i, "")}`; // /to-spec titles start "Spec: "
+    const url = await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", title, "--body", body]);
     say(`Opened draft PR ${specBranch} → ${main}`);
     return { number: Number(url.match(/\/pull\/(\d+)/)![1]), state: "OPEN", isDraft: true };
   }

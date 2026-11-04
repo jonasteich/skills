@@ -300,6 +300,17 @@ test("run: builds the frontier into spec/<N>, unblocking as tickets merge", asyn
   assert.match(readFileSync(join(gh.repo, ".git/info/exclude"), "utf8"), /^\.worktrees\/$/m);
 });
 
+test("run: the spec PR title doesn't repeat a spec issue's own 'Spec:' prefix", async () => {
+  const spec = JSON.stringify({ title: "Spec: tiny math module", url: "https://github.com/o/r/issues/1" });
+  const gh = fakeRepo({
+    issues: [open(2)],
+    override: (line) => (line === "gh issue view 1 --json title,url" ? Promise.resolve({ code: 0, stdout: spec, stderr: "" }) : undefined),
+  });
+  await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, deps(gh.exec));
+  const create = gh.calls.find((c) => c.line.startsWith("gh pr create --draft"))!.line;
+  assert.match(create, /--title Spec #1: tiny math module --body/);
+});
+
 test("run: a rerun after a crash picks up where it stopped", async () => {
   const gh = fakeRepo({
     issues: [open(2, ["jonasteich"]), open(4, ["jonasteich"]), open(6, ["jonasteich"]), open(8, ["someone"])],
