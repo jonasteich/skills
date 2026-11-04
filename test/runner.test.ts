@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readd
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checks, children, claudeArgs, clean, frontier, refusal, run, summary, unresolvedFindings } from "../plugins/workflow/bin/runner.ts";
+import { checks, children, claudeArgs, clean, frontier, refusal, run, summary, unresolvedFindings, usageLimit, LIMIT_FALLBACK_MS } from "../plugins/workflow/bin/runner.ts";
 import type { Exec } from "../plugins/workflow/bin/runner.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -422,4 +422,93 @@ test("unresolvedFindings: bullets after the last marker; None is empty", () => {
   assert.deepEqual(unresolvedFindings("x\nUnresolved findings:\n- a\n* b\nthanks"), ["a", "b"]);
   assert.deepEqual(unresolvedFindings("Unresolved findings:\nNone"), []);
   assert.deepEqual(unresolvedFindings("no marker\n- a"), []);
+});
+
+// ── Usage limits ──
+
+const init = (id = "s1") => `{"type":"system","subtype":"init","session_id":"${id}"}\n`;
+const limitEvent = (status: string, resetsAt: number, id = "s1") =>
+  JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status, resetsAt, rateLimitType: "five_hour" }, session_id: id }) + "\n";
+const limitResult = (text: string, id = "s1") =>
+  JSON.stringify({ type: "result", subtype: "success", is_error: true, api_error_status: 429, result: text, session_id: id }) + "\n";
+const NOW = Date.UTC(2026, 10, 4, 9, 0); // Wed 2026-11-04 10:00 in Berlin
+
+test("usageLimit: the rejected rate_limit_event's resetsAt, in epoch seconds", () => {
+  const log = init() + limitEvent("allowed", 1793780000) + limitEvent("rejected", 1793792400) + limitResult("You've hit your session limit · resets 12:40pm");
+  assert.equal(usageLimit(log, NOW), Date.UTC(2026, 10, 4, 11, 40));
+});
+
+test("usageLimit: the reset time from the limit message, in its zone or the local one", () => {
+  const at = (text: string) => usageLimit(init() + limitResult(text), NOW, "Europe/Berlin");
+  assert.equal(at("You've hit your 5-hour limit · resets 12:40pm (Europe/Berlin)"), Date.UTC(2026, 10, 4, 11, 40));
+  assert.equal(at("You've hit your limit · resets 11am (Europe/Madrid)"), Date.UTC(2026, 10, 4, 10, 0));
+  assert.equal(at("You've hit your session limit · resets 3:45pm"), Date.UTC(2026, 10, 4, 14, 45));
+  assert.equal(at("You've hit your Opus limit · resets 9am"), Date.UTC(2026, 10, 5, 8, 0), "past today: tomorrow");
+  assert.equal(at("You've hit your weekly limit · resets Mon 12:00am"), Date.UTC(2026, 10, 8, 23, 0));
+  assert.equal(at("Claude usage limit reached. Your limit will reset at 1pm (Etc/GMT+5)."), Date.UTC(2026, 10, 4, 18, 0));
+});
+
+test("usageLimit: a limit whose reset can't be read waits the fallback", () => {
+  const at = (text: string) => usageLimit(init() + limitResult(text), NOW, "Europe/Berlin");
+  assert.equal(at("You've hit your weekly limit · resets whenever"), NOW + LIMIT_FALLBACK_MS);
+  assert.equal(at("You've hit your limit · resets 3pm (Mars/Olympus)"), NOW + LIMIT_FALLBACK_MS);
+});
+
+test("usageLimit: a reset already past waits a minute, so a stale clock can't spin", () => {
+  assert.equal(usageLimit(init() + limitEvent("rejected", NOW / 1000 - 5), NOW), NOW + 60_000);
+});
+
+test("usageLimit: none for other failures, warnings, or a limit from an earlier turn", () => {
+  const failed = JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, result: "Tests kept failing" }) + "\n";
+  const warned = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "You've used 85% of your session limit · resets 3:45pm" }) + "\n";
+  assert.equal(usageLimit(init() + failed, NOW), null);
+  assert.equal(usageLimit(init() + limitEvent("allowed_warning", 1793792400) + warned, NOW), null);
+  const resumed = init() + limitEvent("rejected", 1793792400) + limitResult("You've hit your session limit · resets 12:40pm") + init() + failed;
+  assert.equal(usageLimit(resumed, NOW), null);
+});
+
+/** Deps with a fake clock: sleeping advances it. */
+const clocked = (exec: Exec, start = NOW) => {
+  const clock = { now: start, slept: [] as number[] };
+  return { clock, deps: { exec, say: () => {}, now: () => clock.now, sleep: async (ms: number) => { clock.slept.push(ms); clock.now += ms; } } };
+};
+/** First claude run in a ticket's worktree hits the usage limit, later ones go to the fake. */
+const limitOnce = (gh: ReturnType<typeof fakeRepo>, ticket: string, resetsAt: number): Exec => {
+  let hit = false;
+  return async (cmd, args, o = {}) => {
+    if (cmd !== "claude" || hit || !o.cwd?.endsWith(`/${ticket}`)) return gh.exec(cmd, args, o);
+    hit = true;
+    gh.calls.push({ line: [cmd, ...args].join(" "), cwd: o.cwd });
+    const id = args[args.indexOf(args.includes("--resume") ? "--resume" : "--session-id") + 1];
+    appendFileSync(o.log!, init(id) + limitEvent("rejected", resetsAt, id) + limitResult("You've hit your session limit · resets 12:40pm", id));
+    return { code: 1, stdout: "", stderr: "" };
+  };
+};
+
+test("run: a usage limit pauses all children until the reset, then resumes the session, no needs-human", async () => {
+  const gh = fakeRepo({ issues: [open(2), open(3)] });
+  const { clock, deps: d } = clocked(limitOnce(gh, "2", 1793792400));
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 1 }, d), 0);
+
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  const id = claude[0].line.match(/--session-id (\S+)/)![1];
+  assert.equal(claude[0].cwd, join(gh.repo, ".worktrees/2"));
+  assert.match(claude[1].line, new RegExp(`^claude -p continue --resume ${id} `), "#2 resumed with its context");
+  assert.equal(claude[2].cwd, join(gh.repo, ".worktrees/3"), "#3 waits out the pause");
+  assert.ok(clock.slept.includes(Date.UTC(2026, 10, 4, 11, 40) - NOW), `slept ${clock.slept}`);
+  assert.equal(at(gh.calls, "needs-human"), -1, "no needs-human");
+  assert.equal(gh.issues.get(2)!.comments, undefined);
+  assert.equal(gh.issues.get(2)!.state, "closed");
+});
+
+test("run: a review child on a usage limit waits for the reset and resumes, the PR still gets ready", async () => {
+  const gh = fakeRepo({ issues: [closed(2)], specBranch: true, prs: [specPr(true)] });
+  const { clock, deps: d } = clocked(limitOnce(gh, "spec-1", 1793792400));
+  assert.equal(await run({ spec: 1, repo: gh.repo, ci: true, concurrency: 2 }, d), 0);
+
+  const claude = gh.calls.filter((c) => c.line.startsWith("claude "));
+  const id = claude[0].line.match(/--session-id (\S+)/)![1];
+  assert.match(claude[1].line, new RegExp(`^claude -p /code-review spec/1 --resume ${id} `), "review turn sent again in its session");
+  assert.deepEqual(clock.slept, [Date.UTC(2026, 10, 4, 11, 40) - NOW]);
+  assert.equal(gh.prs[0].draft, false);
 });

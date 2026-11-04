@@ -105,7 +105,7 @@ function result(log: string): any | null {
 }
 
 /** Why a child that exited didn't finish its ticket, or null when it did. */
-// Seams: #10 tells a usage limit (pause, then resume) apart from a failure here.
+// A usage limit is a failure too; callers check usageLimit() first: pause and resume, not needs-human.
 export function failure(code: number, log: string): string | null {
   const end = result(log);
   if (code !== 0) return `claude exited ${code}`;
@@ -114,7 +114,67 @@ export function failure(code: number, log: string): string | null {
   return null;
 }
 
-const DESIGN_OFF = { "design@skills": false, "impeccable@impeccable": false };
+// ── Usage limits ───────────────────────────────────────────────────────────
+
+/**
+ * When a child that stopped on a usage limit can go on (epoch ms), or null when it hit none.
+ * Reads only the last invocation (from its `init` event on): a resumed log keeps the old limit.
+ * Prefers the structured `rate_limit_event`; falls back to the limit message's text.
+ */
+export function usageLimit(log: string, now: number, zone = Intl.DateTimeFormat().resolvedOptions().timeZone): number | null {
+  const turn = log.slice(Math.max(0, log.lastIndexOf('"subtype":"init"')));
+  const events = turn.split("\n").flatMap((l) => {
+    try {
+      return [JSON.parse(l)];
+    } catch {
+      return [];
+    }
+  });
+  const rejected = events.findLast((e) => e.type === "rate_limit_event" && e.rate_limit_info?.status === "rejected");
+  const resetsAt = rejected?.rate_limit_info.resetsAt;
+  // "You've hit your session limit · resets 3:45pm", "Your limit will reset at 1pm (Etc/GMT+5)."
+  const said = turn.match(/hit your (?:[\w-]+ )?limit · resets ([^"\\\n]+)|limit will reset at ([^"\\\n]+?)\.?(?:"|\\n|$)/m);
+  if (!said && !rejected) return null;
+  const reset = typeof resetsAt === "number" ? resetsAt * 1000 : said ? resetTime((said[1] ?? said[2]).trim(), now, zone) : null;
+  return reset === null ? now + LIMIT_FALLBACK_MS : Math.max(reset, now + 60_000); // a past reset can't spin
+}
+
+/** How long to wait when a limit's reset time can't be read. */
+export const LIMIT_FALLBACK_MS = 30 * 60_000;
+
+/** Next "3:45pm", "11am" or "Mon 12:00am" after `now`, with an optional " (Area/City)" zone. */
+function resetTime(text: string, now: number, zone: string): number | null {
+  const m = text.match(/^(?:(sun|mon|tue|wed|thu|fri|sat)\w*\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?$/i);
+  if (!m) return null;
+  const [, day, h, min = "0", half, tz = zone] = m;
+  const hour = (Number(h) % (half ? 12 : 24)) + (half?.toLowerCase() === "pm" ? 12 : 0);
+  try {
+    const wall = (t: number) => {
+      const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", weekday: "short" }).formatToParts(t);
+      const get = (type: string) => parts.find((p) => p.type === type)!.value;
+      return { y: +get("year"), mo: +get("month") - 1, d: +get("day"), h: +get("hour"), mi: +get("minute"), wd: get("weekday").toLowerCase() };
+    };
+    // Wall clock in `tz` → instant: guess as UTC, correct by the zone's offset there (twice, for DST edges).
+    const at = (y: number, mo: number, d: number) => {
+      let t = Date.UTC(y, mo, d, hour, Number(min));
+      for (let i = 0; i < 2; i++) {
+        const w = wall(t);
+        t += Date.UTC(y, mo, d, hour, Number(min)) - Date.UTC(w.y, w.mo, w.d, w.h, w.mi);
+      }
+      return t;
+    };
+    const today = wall(now);
+    for (let ahead = 0; ahead <= 7; ahead++) {
+      const t = at(today.y, today.mo, today.d + ahead);
+      if (t > now && (!day || wall(t).wd === day.toLowerCase().slice(0, 3))) return t;
+    }
+  } catch {
+    return null; // unknown zone
+  }
+  return null;
+}
+
+const DESIGN_OFF ={ "design@skills": false, "impeccable@impeccable": false };
 
 /**
  * Arguments for a fresh child, or for resuming one whose session already exists.
@@ -246,7 +306,7 @@ export const realExec: Exec = (cmd, args, opts = {}) =>
     });
   });
 
-export type Deps = { exec: Exec; sleep: (ms: number) => Promise<unknown>; say: (msg: string) => void };
+export type Deps = { exec: Exec; sleep: (ms: number) => Promise<unknown>; say: (msg: string) => void; now?: () => number };
 export type Options = { spec: number; repo: string; ci: boolean; concurrency: number };
 
 // ── The loop ───────────────────────────────────────────────────────────────
@@ -255,6 +315,7 @@ export type Options = { spec: number; repo: string; ci: boolean; concurrency: nu
 export async function run(opts: Options, deps: Deps): Promise<number> {
   const { spec, repo, ci, concurrency } = opts;
   const { exec, say } = deps;
+  const now = deps.now ?? Date.now;
   const specBranch = `spec/${spec}`;
 
   const why = refusal(repoFacts(repo), { ci });
@@ -292,6 +353,7 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   const stuck: Stuck[] = [];
   let tickets: Ticket[] = [];
   let labelReady: Promise<string> | undefined; // `needs-human` created once per run
+  let pausedUntil = 0; // a usage limit: no child starts before then
 
   while (true) {
     tickets = children(await must("gh", ["api", `repos/{owner}/{repo}/issues/${spec}/sub_issues`, "--paginate", "--slurp"]));
@@ -301,18 +363,21 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     // Ours from an earlier run first (a PR waits on CI, otherwise its child (re)starts), then the frontier.
     const mine = tickets.filter((t) => t.open && t.assignees.includes(me) && !tracked(t));
     for (const t of mine.filter((t) => prs.has(t.number))) waiting.set(t.number, { ticket: t, pr: prs.get(t.number)!, misses: 0 });
+    // A child that stopped on a usage limit is still ours and unfinished, so it's in `mine` and resumes here.
     const queue = [...mine.filter((t) => !prs.has(t.number)), ...frontier(tickets)];
-    while (running.size < concurrency && queue.length) {
+    const paused = now() < pausedUntil;
+    while (!paused && running.size < concurrency && queue.length) {
       const t = queue.shift()!;
       if (!t.assignees.includes(me)) await must("gh", ["issue", "edit", String(t.number), "--add-assignee", "@me"]);
       running.set(t.number, startChild(t));
     }
 
-    if (running.size === 0 && waiting.size === 0) break;
+    if (running.size === 0 && waiting.size === 0 && !paused) break;
     if (await pollWaiting()) continue; // a merge may have unblocked tickets
 
-    // React as soon as a child exits; wake for the next CI poll only if a PR is waiting.
-    const poll = waiting.size ? deps.sleep(POLL_MS).then(() => null) : new Promise<null>(() => {});
+    // React as soon as a child exits; wake for the next CI poll if a PR is waiting, or when a pause ends.
+    const wake = Math.min(waiting.size ? POLL_MS : Infinity, paused ? pausedUntil - now() : Infinity);
+    const poll = wake < Infinity ? deps.sleep(wake).then(() => null) : new Promise<null>(() => {});
     const next = await Promise.race([...running.values(), poll]);
     if (next) {
       running.delete(next.ticket.number);
@@ -379,7 +444,10 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
 
   /** A child exited: push its branch and open the ticket PR into spec/<N>. */
   async function publish({ ticket: t, code }: Done) {
-    const why = failure(code, existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "");
+    const log = existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "";
+    const why = failure(code, log);
+    const limit = why ? usageLimit(log, now()) : null;
+    if (limit) return pause(t, limit);
     if (why) return giveUp(t, why);
     const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..${branch(t)}`], worktree(t)));
     if (!ahead) return giveUp(t, NO_COMMIT);
@@ -389,6 +457,12 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const pr = Number(url.match(/\/pull\/(\d+)/)![1]);
     say(`#${t.number}: opened PR #${pr}`);
     waiting.set(t.number, { ticket: t, pr, misses: 0 });
+  }
+
+  /** A usage limit, not a failure: no child starts until the reset; the ticket stays ours and resumes then. */
+  function pause(t: Ticket, until: number) {
+    pausedUntil = Math.max(pausedUntil, until);
+    say(`#${t.number}: usage limit, pausing children until ${new Date(pausedUntil).toLocaleString()}`);
   }
 
   /** Merges every waiting PR whose checks passed (all of them under --no-ci). True if any merged. */
@@ -462,6 +536,12 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
       args[1] = turns[turn]; // same flags as a ticket child, the review's own prompt
       const out = await exec("claude", args, { cwd: dir, log });
       const why = failure(out.code, read());
+      const limit = why ? usageLimit(read(), now()) : null;
+      if (limit) {
+        say(`${specBranch}: usage limit, review paused until ${new Date(limit).toLocaleString()}`);
+        await deps.sleep(Math.max(0, limit - now()));
+        continue; // the same turn again, resumed in its session
+      }
       if (why) {
         say(`${specBranch}: review stopped: ${why}, log ${log}; the PR stays draft, rerun to resume`);
         return false;
