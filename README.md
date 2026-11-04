@@ -9,6 +9,7 @@ Jonas Teichrüb's personal Claude Code setup, the **fleet**: a Claude Code plugi
 ```
 /plugin marketplace add jonasteich/skills
 /plugin install engineering@skills
+/plugin install workflow@skills
 ```
 
 From a local clone: `/plugin marketplace add ~/Personal/skills`. Manifests carry no `version`, so an install tracks commits; pull changes with `/plugin marketplace update skills`.
@@ -18,6 +19,7 @@ From a local clone: `/plugin marketplace add ~/Personal/skills`. Manifests carry
 | Plugin | Upstream | Pinned | License |
 | --- | --- | --- | --- |
 | `engineering` | [mattpocock/skills](https://github.com/mattpocock/skills) | `v1.3.1` | MIT © Matt Pocock ([LICENSE](plugins/engineering/LICENSE)) |
+| `workflow` | own | n/a | MIT © Jonas Teichrüb ([LICENSE](plugins/workflow/LICENSE)) |
 
 ### `engineering`
 
@@ -27,9 +29,15 @@ setup-matt-pocock-skills, wayfinder, grill-with-docs, grilling, domain-modeling,
 
 The other upstream skills stay in the tree but are not registered, so they never load. Edits to upstream files are logged in [`plugins/engineering/CHANGES.md`](plugins/engineering/CHANGES.md).
 
+### `workflow`
+
+My own workflow tooling at `plugins/workflow/`. Registered skills:
+
+- [workflow-retro](plugins/workflow/skills/workflow-retro/SKILL.md): `/workflow-retro [--since <date>] [--repo <path>]` reads session history, transcripts, runner logs and `needs-human` threads, and drafts one issue per recurring skill-chain friction on this repo (label `workflow-retro`). Nothing is filed without an OK.
+
 ## Credits
 
-All skills here are the work of their upstream authors; this repo only selects and wires them. Thanks to [Matt Pocock](https://github.com/mattpocock) for [mattpocock/skills](https://github.com/mattpocock/skills).
+The `engineering` skills are the work of their upstream authors; this repo only selects and wires them. `workflow` is my own. Thanks to [Matt Pocock](https://github.com/mattpocock) for [mattpocock/skills](https://github.com/mattpocock/skills).
 
 ## Development
 
