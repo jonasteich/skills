@@ -36,6 +36,12 @@
       ]
     },
     {
+      "name": "design",
+      "source": "./plugins/design",
+      "description": "Paul Bakaus's impeccable design skill (pbakaus/impeccable), with its agents and hooks, as shipped.",
+      "category": "design"
+    },
+    {
       "name": "workflow",
       "source": "./plugins/workflow/skills",
       "description": "Jonas Teichrüb's own workflow tooling: /workflow-retro turns skill-chain friction into issues.",
