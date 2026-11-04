@@ -13,14 +13,16 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync } from "node:fs";
-import { realpathSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 
 const POLL_MS = 60_000; // only PRs waiting on CI are polled
 const NO_CHECKS_GRACE = 3; // polls to wait for CI to register checks on a fresh PR
+
+/** A file's text, or "" when it doesn't exist (yet). */
+const readText = (path: string) => (existsSync(path) ? readFileSync(path, "utf8") : "");
 
 // ── Preflight ──────────────────────────────────────────────────────────────
 
@@ -43,10 +45,9 @@ export function refusal(repo: RepoFacts, opts: { ci: boolean }): string | null {
 }
 
 function repoFacts(repo: string): RepoFacts {
-  const read = (path: string) => (existsSync(join(repo, path)) ? readFileSync(join(repo, path), "utf8") : null);
   const workflows = join(repo, ".github/workflows");
   return {
-    tracker: read("docs/agents/issue-tracker.md"),
+    tracker: readText(join(repo, "docs/agents/issue-tracker.md")) || null,
     scratch: existsSync(join(repo, ".scratch")),
     ci: existsSync(workflows) && readdirSync(workflows).some((f) => /\.ya?ml$/.test(f)),
   };
@@ -93,13 +94,17 @@ export function sessionOf(log: string): string | null {
   return ids.at(-1)?.[1] ?? null;
 }
 
+/** The child's last invocation, from its `init` event on: a resumed log keeps the earlier ones. */
+function lastInvocation(log: string): string {
+  return log.slice(Math.max(0, log.lastIndexOf('"subtype":"init"')));
+}
+
 /**
  * The child's final result event, if its last turn ended. Claude streams a few
- * system events after the result, so it's the last result since the last `init`.
+ * system events after the result, so it's the last result of the last invocation.
  */
 function result(log: string): any | null {
-  const turn = log.slice(Math.max(0, log.lastIndexOf('"subtype":"init"')));
-  const line = turn.split("\n").findLast((l) => l.includes('"type":"result"'));
+  const line = lastInvocation(log).split("\n").findLast((l) => l.includes('"type":"result"'));
   try {
     return line ? JSON.parse(line) : null;
   } catch {
@@ -107,14 +112,21 @@ function result(log: string): any | null {
   }
 }
 
-/** Why a child that exited didn't finish its ticket, or null when it did. */
-// A usage limit is a failure too; callers check usageLimit() first: pause and resume, not needs-human.
+/**
+ * Why a child that exited didn't finish its turn, or null when it did.
+ * A usage limit is a failure too: callers wait it out (see usageLimit) instead of giving up.
+ */
 export function failure(code: number, log: string): string | null {
   const end = result(log);
   if (code !== 0) return `claude exited ${code}`;
   if (!end) return "claude ended without a result";
   if (end.is_error) return `claude ended with ${end.subtype}`;
   return null;
+}
+
+/** The child's last turn ended cleanly, e.g. before the runner crashed. */
+function finished(log: string): boolean {
+  return failure(0, log) === null;
 }
 
 // ── Usage limits ───────────────────────────────────────────────────────────
@@ -125,7 +137,7 @@ export function failure(code: number, log: string): string | null {
  * Prefers the structured `rate_limit_event`; falls back to the limit message's text.
  */
 export function usageLimit(log: string, now: number, zone = Intl.DateTimeFormat().resolvedOptions().timeZone): number | null {
-  const turn = log.slice(Math.max(0, log.lastIndexOf('"subtype":"init"')));
+  const turn = lastInvocation(log);
   const events = turn.split("\n").flatMap((l) => {
     try {
       return [JSON.parse(l)];
@@ -136,9 +148,9 @@ export function usageLimit(log: string, now: number, zone = Intl.DateTimeFormat(
   const rejected = events.findLast((e) => e.type === "rate_limit_event" && e.rate_limit_info?.status === "rejected");
   const resetsAt = rejected?.rate_limit_info.resetsAt;
   // "You've hit your session limit · resets 3:45pm", "Your limit will reset at 1pm (Etc/GMT+5)."
-  const said = turn.match(/hit your (?:[\w-]+ )?limit · resets ([^"\\\n]+)|limit will reset at ([^"\\\n]+?)\.?(?:"|\\n|$)/m);
-  if (!said && !rejected) return null;
-  const reset = typeof resetsAt === "number" ? resetsAt * 1000 : said ? resetTime((said[1] ?? said[2]).trim(), now, zone) : null;
+  const message = turn.match(/hit your (?:[\w-]+ )?limit · resets ([^"\\\n]+)|limit will reset at ([^"\\\n]+?)\.?(?:"|\\n|$)/m);
+  if (!message && !rejected) return null;
+  const reset = typeof resetsAt === "number" ? resetsAt * 1000 : message ? resetTime((message[1] ?? message[2]).trim(), now, zone) : null;
   return reset === null ? now + LIMIT_FALLBACK_MS : Math.max(reset, now + 60_000); // a past reset can't spin
 }
 
@@ -177,21 +189,23 @@ function resetTime(text: string, now: number, zone: string): number | null {
   return null;
 }
 
-const DESIGN_OFF ={ "design@skills": false, "impeccable@impeccable": false };
+const DESIGN_OFF = { "design@skills": false, "impeccable@impeccable": false };
 
-/**
- * Arguments for a fresh child, or for resuming one whose session already exists.
- * `context` (a retry's answer from Jonas) follows the fresh prompt; `session.prompt`
- * replaces "continue" for a resumed run.
- */
-export function claudeArgs(ticket: Ticket, session: { id: string; resume: boolean; prompt?: string }, context = ""): string[] {
-  const start = session.resume
-    ? ["-p", session.prompt ?? "continue", "--resume", session.id]
-    : ["-p", `/implement #${ticket.number}${context && `\n\n${context}`}`, "--session-id", session.id];
-  // Non-ui tickets run without the design plugin, so its Stop "design deep pass"
+/** What a child is asked, and whether its work is UI (the design plugin stays on). */
+export type Prompt = { text: string; ui: boolean };
+
+const isUi = (t: Ticket) => t.labels.includes("ui");
+
+/** A ticket's first prompt; `context` (a retry's answers) follows it. */
+const implement = (t: Ticket, context = ""): Prompt => ({ text: `/implement #${t.number}${context && `\n\n${context}`}`, ui: isUi(t) });
+
+/** Arguments for a fresh child, or for resuming one whose session already exists. */
+export function claudeArgs(prompt: Prompt, session: { id: string; resume: boolean }): string[] {
+  const start = ["-p", prompt.text, session.resume ? "--resume" : "--session-id", session.id];
+  // Non-ui work runs without the design plugin, so its Stop "design deep pass"
   // hook and agents don't burn tokens on backend work. Both install ids: this
   // marketplace's and impeccable's own, if that is installed too.
-  const design = ticket.labels.includes("ui") ? [] : ["--settings", JSON.stringify({ enabledPlugins: DESIGN_OFF })];
+  const design = prompt.ui ? [] : ["--settings", JSON.stringify({ enabledPlugins: DESIGN_OFF })];
   // Headless -p denies anything needing approval unless a mode is set.
   // Hook events in the log show whether the design Stop hook ran.
   const stream = ["--output-format", "stream-json", "--verbose", "--include-hook-events"];
@@ -266,10 +280,10 @@ export const NEEDS_HUMAN_MARK = "<!-- runner:needs-human -->";
 /** The `needs-human` comment: Claude's question, or why the runner stopped plus a log summary. */
 export function needsHuman(why: string, log: string, at: { log: string; worktree: string }): string {
   const end = result(log);
-  const said = String(end?.result ?? "").trim();
+  const reply = String(end?.result ?? "").trim();
   const quote = (text: string) => text.split("\n").map((l) => `> ${l}`).join("\n");
-  const head = why === NO_COMMIT && said ? "Claude stopped with a question:" : `The runner stopped on this ticket: ${why}.`;
-  const last = said && why !== NO_COMMIT ? ["", "Claude's last message:", "", quote(said)] : said ? ["", quote(said)] : [];
+  const head = why === NO_COMMIT && reply ? "Claude stopped with a question:" : `The runner stopped on this ticket: ${why}.`;
+  const last = reply && why !== NO_COMMIT ? ["", "Claude's last message:", "", quote(reply)] : reply ? ["", quote(reply)] : [];
   const denied = end?.permission_denials?.length ? `, ${end.permission_denials.length} permission denials` : "";
   const stats = end ? ` (${end.subtype}, ${end.num_turns ?? "?"} turns${denied})` : " (no result: the child was cut off)";
   return [
@@ -284,12 +298,18 @@ export function needsHuman(why: string, log: string, at: { log: string; worktree
   ].join("\n");
 }
 
-/** Comments after the runner's last `needs-human` comment (`gh issue view --json comments`). */
+/**
+ * Human comments since the runner first stopped on the ticket, without its own
+ * `needs-human` comments (`gh issue view --json comments`): a second stop keeps the first answer.
+ */
 export function answers(json: string): string {
   const bodies: string[] = JSON.parse(json).comments.map((c: any) => c.body);
-  const mark = bodies.findLastIndex((b) => b.includes(NEEDS_HUMAN_MARK));
-  return bodies.slice(mark + 1).join("\n\n---\n\n").trim();
+  const first = bodies.findIndex((b) => b.includes(NEEDS_HUMAN_MARK));
+  return bodies.slice(first + 1).filter((b) => !b.includes(NEEDS_HUMAN_MARK)).join("\n\n---\n\n").trim();
 }
+
+/** The number in a PR's URL, as `gh pr create` prints it. */
+const prNumber = (url: string) => Number(url.match(/\/pull\/(\d+)/)![1]);
 
 // ── Exec seam: every gh, git and claude call goes through here ─────────────
 
@@ -357,26 +377,29 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     return 2;
   }
 
-  const sh = (cmd: string, args: string[], cwd = repo) => exec(cmd, args, { cwd });
-  const must = async (cmd: string, args: string[], cwd = repo) => {
-    const out = await sh(cmd, args, cwd);
+  /** Runs a command that may fail; the caller reads the result. */
+  const attempt = (cmd: string, args: string[], cwd = repo) => exec(cmd, args, { cwd });
+  /** Runs a command that must succeed; returns its trimmed stdout. */
+  const output = async (cmd: string, args: string[], cwd = repo) => {
+    const out = await attempt(cmd, args, cwd);
     if (out.code !== 0) throw new Error(`${cmd} ${args.join(" ")} failed (${out.code}): ${out.stderr.trim()}`);
     return out.stdout.trim();
   };
   const worktree = (t: Ticket) => join(repo, ".worktrees", String(t.number));
   const logOf = (t: Ticket) => join(repo, ".worktrees/logs", `${t.number}.jsonl`);
+  const readLog = (t: Ticket) => readText(logOf(t));
   const branch = (t: Ticket) => `ticket/${t.number}`;
 
-  // Setup: who claims, keep .worktrees/ out of the target repo's status, spec/<N> from main.
-  const me = await must("gh", ["api", "user", "--jq", ".login"]);
-  const specIssue = JSON.parse(await must("gh", ["issue", "view", String(spec), "--json", "title,url"]));
-  const main = await must("gh", ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"]);
+  // Setup: who claims, keep .worktrees/ out of the target repo's status, spec/<N> from the default branch.
+  const me = await output("gh", ["api", "user", "--jq", ".login"]);
+  const specIssue = JSON.parse(await output("gh", ["issue", "view", String(spec), "--json", "title,url"]));
+  const defaultBranch = await output("gh", ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"]);
   await ignoreWorktrees();
-  await must("git", ["fetch", "origin"]);
-  if ((await sh("git", ["ls-remote", "--exit-code", "--heads", "origin", specBranch])).code !== 0) {
-    await must("git", ["push", "origin", `origin/${main}:refs/heads/${specBranch}`]);
-    await must("git", ["fetch", "origin"]);
-    say(`Created ${specBranch} from ${main}`);
+  await output("git", ["fetch", "origin"]);
+  if ((await attempt("git", ["ls-remote", "--exit-code", "--heads", "origin", specBranch])).code !== 0) {
+    await output("git", ["push", "origin", `origin/${defaultBranch}:refs/heads/${specBranch}`]);
+    await output("git", ["fetch", "origin"]);
+    say(`Created ${specBranch} from ${defaultBranch}`);
   }
 
   type Done = { ticket: Ticket; code: number };
@@ -386,10 +409,9 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   const stuck: Stuck[] = [];
   let tickets: Ticket[] = [];
   let labelReady: Promise<string> | undefined; // `needs-human` created once per run
-  let pausedUntil = 0; // a usage limit: no child starts before then
 
   while (true) {
-    tickets = children(await must("gh", ["api", `repos/{owner}/{repo}/issues/${spec}/sub_issues`, "--paginate", "--slurp"]));
+    tickets = children(await output("gh", ["api", `repos/{owner}/{repo}/issues/${spec}/sub_issues`, "--paginate", "--slurp"]));
     const prs = await openTicketPrs();
     const tracked = (t: Ticket) => running.has(t.number) || waiting.has(t.number) || stuck.some((s) => s.ticket.number === t.number);
 
@@ -398,20 +420,18 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     for (const t of mine.filter((t) => prs.has(t.number))) waiting.set(t.number, { ticket: t, pr: prs.get(t.number)!, misses: 0 });
     // A child that stopped on a usage limit is still ours and unfinished, so it's in `mine` and resumes here.
     const queue = [...mine.filter((t) => !prs.has(t.number)), ...frontier(tickets)];
-    const paused = now() < pausedUntil;
-    while (!paused && running.size < concurrency && queue.length) {
+    while (running.size < concurrency && queue.length) {
       const t = queue.shift()!;
-      if (!t.assignees.includes(me)) await must("gh", ["issue", "edit", String(t.number), "--add-assignee", "@me"]);
+      if (!t.assignees.includes(me)) await output("gh", ["issue", "edit", String(t.number), "--add-assignee", "@me"]);
       running.set(t.number, startChild(t));
     }
 
-    if (running.size === 0 && waiting.size === 0 && !paused) break;
+    if (running.size === 0 && waiting.size === 0) break;
     if (await pollWaiting()) continue; // a merge may have unblocked tickets
-    if (running.size === 0 && waiting.size === 0 && !paused) continue; // the last waiting PR got stuck: nothing left to wait on
+    if (running.size === 0 && waiting.size === 0) continue; // the last waiting PR got stuck: nothing left to wait on
 
-    // React as soon as a child exits; wake for the next CI poll if a PR is waiting, or when a pause ends.
-    const wake = Math.min(waiting.size ? POLL_MS : Infinity, paused ? pausedUntil - now() : Infinity);
-    const poll = wake < Infinity ? deps.sleep(wake).then(() => null) : new Promise<null>(() => {});
+    // React as soon as a child exits; wake for the next CI poll if a PR is waiting.
+    const poll = waiting.size ? deps.sleep(POLL_MS).then(() => null) : new Promise<null>(() => {});
     const next = await Promise.race([...running.values(), poll]);
     if (next) {
       running.delete(next.ticket.number);
@@ -428,15 +448,15 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
   // ── Steps ──
 
   async function ignoreWorktrees() {
-    const exclude = resolve(repo, await must("git", ["rev-parse", "--git-path", "info/exclude"]));
-    const text = existsSync(exclude) ? readFileSync(exclude, "utf8") : "";
+    const exclude = resolve(repo, await output("git", ["rev-parse", "--git-path", "info/exclude"]));
+    const text = readText(exclude);
     if (/^\/?\.worktrees\/?$/m.test(text)) return;
     mkdirSync(dirname(exclude), { recursive: true });
     appendFileSync(exclude, `${text && !text.endsWith("\n") ? "\n" : ""}.worktrees/\n`);
   }
 
   async function openTicketPrs(): Promise<Map<number, number>> {
-    const out = await must("gh", ["pr", "list", "--base", specBranch, "--state", "open", "--json", "number,headRefName", "--limit", "200"]);
+    const out = await output("gh", ["pr", "list", "--base", specBranch, "--state", "open", "--json", "number,headRefName", "--limit", "200"]);
     const prs = JSON.parse(out) as { number: number; headRefName: string }[];
     return new Map(
       prs.flatMap((p) => {
@@ -451,56 +471,76 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
     const dir = worktree(t);
     const context = !t.assignees.includes(me) && (existsSync(dir) || existsSync(logOf(t))) ? await retry(t) : "";
     if (!existsSync(dir)) {
-      const exists = (await sh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch(t)}`])).code === 0;
-      await must("git", exists ? ["worktree", "add", dir, branch(t)] : ["worktree", "add", "-b", branch(t), dir, `origin/${specBranch}`]);
+      const exists = (await attempt("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch(t)}`])).code === 0;
+      await output("git", exists ? ["worktree", "add", dir, branch(t)] : ["worktree", "add", "-b", branch(t), dir, `origin/${specBranch}`]);
     }
     mkdirSync(dirname(logOf(t)), { recursive: true });
-    const log = existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "";
-    if (failure(0, log) === null) return { ticket: t, code: 0 }; // finished before a crash
+    const log = readLog(t);
+    if (finished(log)) return { ticket: t, code: 0 }; // finished before a crash
     const id = sessionOf(log);
     say(`#${t.number}: ${id ? "resuming" : "starting"} claude in ${dir}`);
-    const args = claudeArgs(t, id ? { id, resume: true } : { id: randomUUID(), resume: false }, context);
+    const args = id ? claudeArgs({ text: "continue", ui: isUi(t) }, { id, resume: true }) : claudeArgs(implement(t, context), { id: randomUUID(), resume: false });
     const out = await exec("claude", args, { cwd: dir, log: logOf(t) });
     return { ticket: t, code: out.code };
   }
 
   /**
-   * A ticket we gave up on earlier is takeable again: Jonas removed `needs-human`.
-   * Drops the old worktree, keeps the old log aside, returns his answer for the fresh child.
+   * A ticket we gave up on earlier is takeable again: someone removed `needs-human`.
+   * Drops the old worktree, keeps the old log aside, returns the answers for the fresh child.
    */
   async function retry(t: Ticket): Promise<string> {
-    await sh("git", ["worktree", "remove", "--force", worktree(t)]);
+    await attempt("git", ["worktree", "remove", "--force", worktree(t)]);
     if (existsSync(logOf(t))) renameSync(logOf(t), logOf(t).replace(/\.jsonl$/, `.${Date.now()}.jsonl`));
-    const answer = answers(await must("gh", ["issue", "view", String(t.number), "--json", "comments"]));
+    // The local branch is the stopped run's: start from what was pushed (its PR's), else the spec/<N> tip.
+    const pushed = (await attempt("git", ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch(t)}`])).code === 0;
+    await output("git", ["branch", "-f", branch(t), pushed ? `origin/${branch(t)}` : `origin/${specBranch}`]);
+    const answer = answers(await output("gh", ["issue", "view", String(t.number), "--json", "comments"]));
     say(`#${t.number}: retrying after needs-human`);
-    return answer && `This is a retry: the runner stopped on this ticket earlier. Jonas answered on the ticket:\n\n${answer}`;
+    return answer && `This is a retry: the runner stopped on this ticket earlier. Answers on the ticket since then:\n\n${answer}`;
   }
 
   /** A child exited: push its branch and open the ticket PR into spec/<N>. */
   async function publish({ ticket: t, code }: Done) {
-    const log = existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "";
-    const why = failure(code, log);
-    const limit = why ? usageLimit(log, now()) : null;
-    if (limit) return pause(t, limit);
+    const why = failure(code, readLog(t));
+    if (why && (await waitOutLimit(`#${t.number}`, readLog(t)))) return; // still ours and unfinished: resumes on the next pass
     if (why) return giveUp(t, why);
-    const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..${branch(t)}`], worktree(t)));
+    const ahead = Number(await output("git", ["rev-list", "--count", `origin/${specBranch}..${branch(t)}`], worktree(t)));
     if (!ahead) return giveUp(t, NO_COMMIT);
-    await must("git", ["push", "-u", "origin", branch(t)], worktree(t));
+    await output("git", ["push", "-u", "origin", branch(t)], worktree(t));
     // A retry after a CI failure or a conflict pushes to the PR it already has.
     let pr = (await openTicketPrs()).get(t.number);
     if (pr === undefined) {
       const body = `Ticket #${t.number} for spec #${spec}, built by the runner. The runner merges it and closes #${t.number}.`;
-      const url = await must("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]);
-      pr = Number(url.match(/\/pull\/(\d+)/)![1]);
+      pr = prNumber(await output("gh", ["pr", "create", "--base", specBranch, "--head", branch(t), "--title", t.title, "--body", body]));
       say(`#${t.number}: opened PR #${pr}`);
     } else say(`#${t.number}: pushed to PR #${pr}`);
     waiting.set(t.number, { ticket: t, pr, misses: 0 });
   }
 
-  /** A usage limit, not a failure: no child starts until the reset; the ticket stays ours and resumes then. */
-  function pause(t: Ticket, until: number) {
-    pausedUntil = Math.max(pausedUntil, until);
-    say(`#${t.number}: usage limit, pausing children until ${new Date(pausedUntil).toLocaleString()}`);
+  /**
+   * If the last claude run in `log` stopped on a usage limit: waits until the reset and returns true.
+   * Nothing starts meanwhile. Running children aren't killed: they hit the same limit and exit on
+   * their own, and their tickets resume like this one.
+   */
+  async function waitOutLimit(who: string, log: string): Promise<boolean> {
+    const until = usageLimit(log, now());
+    if (until === null) return false;
+    say(`${who}: usage limit, paused until ${new Date(until).toLocaleString()}`);
+    await deps.sleep(Math.max(0, until - now()));
+    return true;
+  }
+
+  /** Resumes the ticket's own session with `prompt`, again after a usage limit. Why it failed, or null. */
+  async function resumeChild(t: Ticket, prompt: string): Promise<string | null> {
+    const id = sessionOf(readLog(t));
+    if (!id) return "there's no session to resume";
+    const args = claudeArgs({ text: prompt, ui: isUi(t) }, { id, resume: true });
+    let why: string | null;
+    do {
+      const out = await exec("claude", args, { cwd: worktree(t), log: logOf(t) });
+      why = failure(out.code, readLog(t));
+    } while (why && (await waitOutLimit(`#${t.number}`, readLog(t))));
+    return why;
   }
 
   /**
@@ -509,77 +549,92 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
    */
   async function pollWaiting(): Promise<boolean> {
     let any = false;
-    for (const w of [...waiting.values()]) {
-      const update = await updateTicket(w.ticket);
+    for (const entry of [...waiting.values()]) {
+      const { ticket: t, pr } = entry;
+      const update = await updateTicket(t);
       if (update === "stuck") {
-        waiting.delete(w.ticket.number);
+        waiting.delete(t.number);
         continue;
       }
       // The updated branch needs green CI again before it merges.
-      if (update === "pushed" && ci) {
-        w.misses = 0;
+      if (update === "updated" && ci) {
+        entry.misses = 0;
         continue;
       }
-      const state = ci ? checks(await sh("gh", ["pr", "checks", String(w.pr), "--json", "name,bucket"])) : "pass";
-      if (state === "pending" || (state === "none" && ++w.misses < NO_CHECKS_GRACE)) continue;
-      waiting.delete(w.ticket.number);
+      const state = ci ? checks(await attempt("gh", ["pr", "checks", String(pr), "--json", "name,bucket"])) : "pass";
+      if (state === "pending" || (state === "none" && ++entry.misses < NO_CHECKS_GRACE)) continue;
+      waiting.delete(t.number);
       if (state !== "pass") {
-        await giveUp(w.ticket, state === "fail" ? `CI failed on PR #${w.pr}` : `no CI checks on PR #${w.pr}`);
+        await giveUp(t, state === "fail" ? `CI failed on PR #${pr}` : `no CI checks on PR #${pr}`);
         continue;
       }
-      any = (await merge(w.ticket, w.pr)) || any;
+      any = (await merge(t, pr)) || any;
     }
     return any;
   }
 
-  /** Brings the ticket branch up to the spec/<N> tip; a conflict goes back to the child's own session, once. */
-  async function updateTicket(t: Ticket): Promise<"current" | "pushed" | "stuck"> {
+  /**
+   * Brings the ticket branch up to the spec/<N> tip and pushes it. A conflict goes back to the
+   * child's own session, once; under --no-ci so does a clean merge, to rerun the tests.
+   */
+  async function updateTicket(t: Ticket): Promise<"current" | "updated" | "stuck"> {
     const dir = worktree(t);
-    await must("git", ["fetch", "origin"]);
-    if (!existsSync(dir)) await must("git", ["worktree", "add", "-B", branch(t), dir, `origin/${branch(t)}`]);
+    await output("git", ["fetch", "origin"]);
+    if (!existsSync(dir)) await output("git", ["worktree", "add", "-B", branch(t), dir, `origin/${branch(t)}`]);
     const update = await updateFromSpec(exec, dir, specBranch);
-    if (update.status === "current") return "current";
-    const why = update.status === "failed" ? update.why : update.status === "conflict" ? await resolveConflict(t, update.files) : null;
+    let why: string | null;
+    switch (update.status) {
+      case "current":
+        return "current";
+      case "failed":
+        why = update.why;
+        break;
+      case "conflict":
+        why = await resolveConflict(t, update.files); // its prompt reruns the tests too
+        break;
+      case "merged":
+        why = ci ? null : await retest(t); // CI reruns on the push
+        break;
+    }
     if (why) {
       await giveUp(t, why);
       return "stuck";
     }
-    await must("git", ["push", "origin", branch(t)], dir);
+    await output("git", ["push", "origin", branch(t)], dir);
     say(`#${t.number}: updated ${branch(t)} from ${specBranch}`);
-    return "pushed";
+    return "updated";
   }
 
   /** Resumes the ticket's session to resolve the conflicted merge and rerun tests. Why it didn't, or null. */
   async function resolveConflict(t: Ticket, files: string[]): Promise<string | null> {
-    const log = () => (existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "");
-    const id = sessionOf(log());
     const conflict = `merging ${specBranch} into ${branch(t)} conflicted in ${files.join(", ")}`;
-    if (!id) return `${conflict}, and there's no session to resume`;
     say(`#${t.number}: ${conflict}; resuming claude to resolve it`);
     const prompt = `Merging origin/${specBranch} into this branch conflicted in: ${files.join(", ")}. ` +
       "Resolve the conflicts so both sides' changes still work, rerun the tests until they pass, and commit the merge.";
-    let out = await exec("claude", claudeArgs(t, { id, resume: true, prompt }), { cwd: worktree(t), log: logOf(t) });
-    // A usage limit: wait it out (nothing else starts meanwhile), then ask again.
-    for (let limit; failure(out.code, log()) && (limit = usageLimit(log(), now())); ) {
-      say(`#${t.number}: usage limit, conflict resolution paused until ${new Date(limit).toLocaleString()}`);
-      await deps.sleep(Math.max(0, limit - now()));
-      out = await exec("claude", claudeArgs(t, { id, resume: true, prompt }), { cwd: worktree(t), log: logOf(t) });
-    }
-    const why = failure(out.code, log()) ?? (await unmerged(exec, worktree(t)));
-    return why && `${conflict}, still failing after the resumed session: ${why}`;
+    const why = (await resumeChild(t, prompt)) ?? (await unmerged(exec, worktree(t)));
+    return why && `${conflict}, still unresolved: ${why}`;
+  }
+
+  /** --no-ci: nothing checks the merged spec/<N> changes, so the child reruns its tests once. Why they fail, or null. */
+  async function retest(t: Ticket): Promise<string | null> {
+    say(`#${t.number}: merged ${specBranch} into ${branch(t)}; resuming claude to rerun the tests`);
+    const prompt = `This branch was just updated from origin/${specBranch}, and there's no CI to check it. ` +
+      "Rerun the project's tests until they pass, commit any fixes, and don't push.";
+    const why = await resumeChild(t, prompt);
+    return why && `tests after merging ${specBranch} into ${branch(t)} still failing: ${why}`;
   }
 
   async function merge(t: Ticket, pr: number): Promise<boolean> {
-    const out = await sh("gh", ["pr", "merge", String(pr), "--squash"]);
+    const out = await attempt("gh", ["pr", "merge", String(pr), "--squash"]);
     if (out.code !== 0) {
       await giveUp(t, `merge of PR #${pr} failed: ${out.stderr.trim()}`);
       return false;
     }
     // Closing keywords only fire on the default branch, so close the ticket here.
-    await must("gh", ["issue", "close", String(t.number), "--comment", `Merged in #${pr} into ${specBranch}.`]);
-    await sh("git", ["worktree", "remove", "--force", worktree(t)]);
-    await sh("git", ["branch", "-D", branch(t)]);
-    await sh("git", ["push", "origin", "--delete", branch(t)]);
+    await output("gh", ["issue", "close", String(t.number), "--comment", `Merged in #${pr} into ${specBranch}.`]);
+    await attempt("git", ["worktree", "remove", "--force", worktree(t)]);
+    await attempt("git", ["branch", "-D", branch(t)]);
+    await attempt("git", ["push", "origin", "--delete", branch(t)]);
     t.open = false;
     for (const s of tickets) if (s.number === t.number) s.open = false; // `t` may be from an earlier snapshot
     merged.push({ ticket: t, pr });
@@ -590,78 +645,88 @@ export async function run(opts: Options, deps: Deps): Promise<number> {
 
   type SpecPr = { number: number; state: string; isDraft: boolean };
 
-  /** Draft spec/<N> → main, opened after the first merge. Any state counts, so a merged one isn't reopened. */
+  /** Draft spec/<N> → default branch, opened after the first merge. Any state counts, so a merged one isn't reopened. */
   async function ensureSpecPr(): Promise<SpecPr> {
-    const out = await must("gh", ["pr", "list", "--head", specBranch, "--base", main, "--state", "all", "--json", "number,state,isDraft"]);
+    const out = await output("gh", ["pr", "list", "--head", specBranch, "--base", defaultBranch, "--state", "all", "--json", "number,state,isDraft"]);
     const found: SpecPr[] = JSON.parse(out);
     if (found.length) return found[0];
     const body = specPrBody({ number: spec, url: specIssue.url }, tickets);
     const title = `Spec #${spec}: ${specIssue.title.replace(/^Spec:\s*/i, "")}`; // /to-spec titles start "Spec: "
-    const url = await must("gh", ["pr", "create", "--draft", "--base", main, "--head", specBranch, "--title", title, "--body", body]);
-    say(`Opened draft PR ${specBranch} → ${main}`);
-    return { number: Number(url.match(/\/pull\/(\d+)/)![1]), state: "OPEN", isDraft: true };
+    const url = await output("gh", ["pr", "create", "--draft", "--base", defaultBranch, "--head", specBranch, "--title", title, "--body", body]);
+    say(`Opened draft PR ${specBranch} → ${defaultBranch}`);
+    return { number: prNumber(url), state: "OPEN", isDraft: true };
   }
 
   /**
    * All tickets closed: one `/code-review` child on spec/<N> fixes what it can, the rest goes in
-   * the PR body, then the PR is marked ready. Ready (or merged) means reviewed, so a rerun skips it;
-   * an interrupted review resumes from its log. False if the review child failed.
+   * the PR body; once CI passes on the fixes, the PR is marked ready. Ready (or merged) means
+   * reviewed, so a rerun skips it; an interrupted review resumes from its log. False if the
+   * review child failed or CI did.
    */
   async function reviewSpec(pr: SpecPr): Promise<boolean> {
     if (pr.state !== "OPEN" || !pr.isDraft) return true;
     const dir = join(repo, ".worktrees", `spec-${spec}`);
-    const log = join(repo, ".worktrees/logs", `spec-${spec}-review.jsonl`);
-    const read = () => (existsSync(log) ? readFileSync(log, "utf8") : "");
-    const turns = [`/code-review ${specBranch}`, FIX_PROMPT];
-    await must("git", ["fetch", "origin"]);
-    if (!existsSync(dir)) await must("git", ["worktree", "add", "--detach", dir, `origin/${specBranch}`]);
-    mkdirSync(dirname(log), { recursive: true });
+    const logPath = join(repo, ".worktrees/logs", `spec-${spec}-review.jsonl`);
+    const log = () => readText(logPath);
+    // The worktree is at the spec/<N> tip, so the review covers what's changed since the default branch.
+    const turns = [`/code-review origin/${defaultBranch}`, FIX_PROMPT];
+    const ui = tickets.some(isUi);
+    await output("git", ["fetch", "origin"]);
+    if (!existsSync(dir)) await output("git", ["worktree", "add", "--detach", dir, `origin/${specBranch}`]);
+    mkdirSync(dirname(logPath), { recursive: true });
 
     // Turns done = successful results in the log; a failed or killed turn is sent again.
     const results = () =>
-      read().trim().split("\n").flatMap((l) => (l.includes('"type":"result"') ? [JSON.parse(l)] : [])).filter((r) => !r.is_error);
-    const self: Ticket = { number: spec, title: specIssue.title, url: specIssue.url, open: true, assignees: [], labels: [], blockedBy: 0 };
+      log().trim().split("\n").flatMap((l) => (l.includes('"type":"result"') ? [JSON.parse(l)] : [])).filter((r) => !r.is_error);
     for (let turn = results().length; turn < turns.length; turn = results().length) {
-      const id = sessionOf(read());
+      const id = sessionOf(log());
       say(`${specBranch}: ${turn ? "fixing review findings" : "reviewing"} in ${dir}`);
-      const args = claudeArgs(self, id ? { id, resume: true } : { id: randomUUID(), resume: false });
-      args[1] = turns[turn]; // same flags as a ticket child, the review's own prompt
-      const out = await exec("claude", args, { cwd: dir, log });
-      const why = failure(out.code, read());
-      const limit = why ? usageLimit(read(), now()) : null;
-      if (limit) {
-        say(`${specBranch}: usage limit, review paused until ${new Date(limit).toLocaleString()}`);
-        await deps.sleep(Math.max(0, limit - now()));
-        continue; // the same turn again, resumed in its session
-      }
+      const session = id ? { id, resume: true } : { id: randomUUID(), resume: false };
+      const out = await exec("claude", claudeArgs({ text: turns[turn], ui }, session), { cwd: dir, log: logPath });
+      const why = failure(out.code, log());
+      if (why && (await waitOutLimit(specBranch, log()))) continue; // the same turn again, resumed in its session
       if (why) {
-        say(`${specBranch}: review stopped: ${why}, log ${log}; the PR stays draft, rerun to resume`);
+        say(`${specBranch}: review stopped: ${why}, log ${logPath}; the PR stays draft, rerun to resume`);
         return false;
       }
     }
 
-    const ahead = Number(await must("git", ["rev-list", "--count", `origin/${specBranch}..HEAD`], dir));
-    if (ahead) await must("git", ["push", "origin", `HEAD:refs/heads/${specBranch}`], dir);
+    const ahead = Number(await output("git", ["rev-list", "--count", `origin/${specBranch}..HEAD`], dir));
+    if (ahead) await output("git", ["push", "origin", `HEAD:refs/heads/${specBranch}`], dir);
     const unresolved = unresolvedFindings(results().at(-1)?.result ?? "");
-    await must("gh", ["pr", "edit", String(pr.number), "--body", specPrBody({ number: spec, url: specIssue.url }, tickets, unresolved)]);
-    await must("gh", ["pr", "ready", String(pr.number)]);
-    await sh("git", ["worktree", "remove", "--force", dir]);
+    await output("gh", ["pr", "edit", String(pr.number), "--body", specPrBody({ number: spec, url: specIssue.url }, tickets, unresolved)]);
+    const state = ci ? await settledChecks(pr.number) : "pass";
+    if (state !== "pass") {
+      const why = state === "fail" ? `CI failed on PR #${pr.number}` : `no CI checks on PR #${pr.number}`;
+      say(`${specBranch}: stuck: ${why} after the review fixes; the PR stays draft, rerun once it's green`);
+      return false;
+    }
+    await output("gh", ["pr", "ready", String(pr.number)]);
+    await attempt("git", ["worktree", "remove", "--force", dir]);
     say(`${specBranch}: reviewed (${ahead} fix commit(s), ${unresolved.length} unresolved); PR #${pr.number} ready`);
     return true;
   }
 
+  /** Waits for a PR's checks to finish. The first poll waits too, so a fresh push registers its run. */
+  async function settledChecks(pr: number): Promise<Checks> {
+    for (let misses = 0; ; ) {
+      await deps.sleep(POLL_MS);
+      const state = checks(await attempt("gh", ["pr", "checks", String(pr), "--json", "name,bucket"]));
+      if (state !== "pending" && (state !== "none" || ++misses >= NO_CHECKS_GRACE)) return state;
+    }
+  }
+
   /**
-   * Hands a ticket to Jonas: comment (the question, or why + a log summary), `needs-human`, unassign.
+   * Hands a ticket to a human: comment (the question, or why + a log summary), `needs-human`, unassign.
    * Its worktree stays for inspection; removing the label makes it takeable again.
    */
   async function giveUp(t: Ticket, why: string) {
     stuck.push({ ticket: t, why, log: logOf(t) });
     say(`#${t.number}: stuck: ${why}`);
-    const log = existsSync(logOf(t)) ? readFileSync(logOf(t), "utf8") : "";
-    await must("gh", ["issue", "comment", String(t.number), "--body", needsHuman(why, log, { log: logOf(t), worktree: worktree(t) })]);
-    labelReady ??= must("gh", ["label", "create", "needs-human", "--color", "D93F0B", "--description", "Runner stopped: needs Jonas", "--force"]);
+    await output("gh", ["issue", "comment", String(t.number), "--body", needsHuman(why, readLog(t), { log: logOf(t), worktree: worktree(t) })]);
+    labelReady ??= output("gh", ["label", "create", "needs-human", "--color", "D93F0B", "--description", "Runner stopped: needs a human", "--force"]);
     await labelReady;
-    await must("gh", ["issue", "edit", String(t.number), "--add-label", "needs-human", "--remove-assignee", "@me"]);
+    await output("gh", ["issue", "edit", String(t.number), "--add-label", "needs-human", "--remove-assignee", "@me"]);
   }
 }
 
