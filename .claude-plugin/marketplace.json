@@ -13,7 +13,7 @@
       "category": "engineering",
       "strict": false,
       "skills": [
-        "./engineering/setup-matt-pocock-skills",
+        "./engineering/setup",
         "./engineering/wayfinder",
         "./engineering/grill-with-docs",
         "./productivity/grilling",

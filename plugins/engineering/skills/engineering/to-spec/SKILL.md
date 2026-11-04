@@ -8,7 +8,7 @@ This skill takes the current conversation context and codebase understanding and
 
 If invoked with a map (a `wayfinder:map` issue, by URL or number), read the map and its closed child tickets, resolution comments included, as the input alongside the conversation: the spec must reflect every decision on the map.
 
-The issue tracker and triage label vocabulary should have been provided to you. If not, tell the user to run `/setup-matt-pocock-skills`.
+The issue tracker and triage label vocabulary should have been provided to you. If not, tell the user to run `/setup`.
 
 ## Process
 

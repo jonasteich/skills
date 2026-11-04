@@ -27,7 +27,7 @@ From a local clone: `/plugin marketplace add ~/Personal/skills`. Our manifests c
 
 Matt Pocock's engineering skills, vendored as a squashed `git subtree` at `plugins/engineering/`. Registered skills:
 
-setup-matt-pocock-skills, wayfinder, grill-with-docs, grilling, domain-modeling, prototype, research, to-spec, to-tickets, implement, tdd, code-review, pr, codebase-design, improve-codebase-architecture, triage, diagnosing-bugs, wizard, retro, writing-for-agents.
+setup (renamed from upstream's setup-matt-pocock-skills), wayfinder, grill-with-docs, grilling, domain-modeling, prototype, research, to-spec, to-tickets, implement, tdd, code-review, pr, codebase-design, improve-codebase-architecture, triage, diagnosing-bugs, wizard, retro, writing-for-agents.
 
 The other upstream skills stay in the tree but are not registered, so they never load. Edits to upstream files are logged in [`plugins/engineering/CHANGES.md`](plugins/engineering/CHANGES.md).
 
@@ -40,6 +40,11 @@ Paul Bakaus's impeccable plugin (its `plugin/` dir), vendored as a squashed `git
 My own workflow tooling at `plugins/workflow/`. Registered skills:
 
 - [workflow-retro](plugins/workflow/skills/workflow-retro/SKILL.md): `/workflow-retro [--since <date>] [--repo <path>]` reads session history, transcripts, runner logs and `needs-human` threads, and drafts one issue per recurring skill-chain friction on this repo (label `workflow-retro`). Nothing is filed without an OK.
+
+Scripts in [`plugins/workflow/bin/`](plugins/workflow/bin/) (not part of the installed plugin; run from a clone):
+
+- `sync <engineering|design> <tag>`: pulls an upstream subtree to a pinned tag and reapplies the fleet's fixups (license copies, the `/setup` rename). Rerunning it changes nothing.
+- `install`: symlinks the scripts into `~/.local/bin`, so they run from any repo.
 
 ## Credits
 

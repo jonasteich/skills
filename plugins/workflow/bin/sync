@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# sync <upstream> <tag>: pull an upstream plugin subtree to a pinned tag, then
+# reapply the fleet's fixups. Safe to rerun: a second run to the same tag is a no-op.
+#
+#   engineering  mattpocock/skills, whole repo, tags v*. Fixups: skills/LICENSE
+#                copy, setup-matt-pocock-skills -> setup rename.
+#   design       pbakaus/impeccable, its plugin/ dir only (via subtree split of a
+#                cached full clone), tags skill-v*. Fixups: LICENSE, NOTICE.md.
+#
+# Works on the fleet clone this script lives in, from any directory.
+# Env overrides (tests): SYNC_ENGINEERING_URL, SYNC_DESIGN_URL, SYNC_DESIGN_CACHE.
+set -euo pipefail
+
+die() { echo "sync: $*" >&2; exit 1; }
+usage() { echo "usage: sync <engineering|design> <tag>" >&2; exit 2; }
+
+# Resolve symlinks (bin/install links us into ~/.local/bin) to find the clone.
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+root=$(cd -P "$(dirname "$src")/../../.." && pwd)
+
+[ $# -eq 2 ] || usage
+upstream=$1 tag=$2
+cd "$root"
+git diff --quiet && git diff --cached --quiet || die "uncommitted changes in $root; commit them first"
+
+# Rename the setup skill to /setup: move its dir, point the marketplace at it,
+# and rewrite references in the registered engineering skills. Upstream files
+# outside the registered skills (docs, plugin.json, dropped skills) stay as is.
+rename_setup() {
+  local skills=plugins/engineering/skills
+  local old=$skills/engineering/setup-matt-pocock-skills new=$skills/engineering/setup
+  if [ -d "$old" ]; then
+    (cd "$old" && find . -type f) | while IFS= read -r f; do
+      [ ! -e "$new/$f" ] || die "both $old/$f and $new/$f exist; merge them by hand"
+      mkdir -p "$(dirname "$new/$f")"
+      git mv "$old/$f" "$new/$f"
+    done
+    find "$old" -depth -type d -empty -delete
+  fi
+  perl -pi -e 's#"\./engineering/setup-matt-pocock-skills"#"./engineering/setup"#g' .claude-plugin/marketplace.json
+  node -e '
+    const m = JSON.parse(require("fs").readFileSync(".claude-plugin/marketplace.json", "utf8"));
+    const e = m.plugins.find((p) => p.name === "engineering");
+    for (const s of e.skills) console.log(require("path").join(e.source, s));
+  ' | while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    { grep -rlE '(^|[^[:alnum:]_-])setup-matt-pocock-skills' "$d" || true; } | while IFS= read -r f; do
+      rewrite_setup "$f"
+    done
+  done
+}
+
+rewrite_setup() { perl -pi -e 's/(?<![\w-])setup-matt-pocock-skills/setup/g' "$@"; }
+
+# Upstream edits under setup-matt-pocock-skills/ conflict with our move when git
+# misses the rename (modify/delete). Three-way merge each such file into setup/
+# by hand; any other conflict is left for a human.
+resolve_setup_conflicts() {
+  local old=plugins/engineering/skills/engineering/setup-matt-pocock-skills
+  local new=plugins/engineering/skills/engineering/setup
+  local conflicts p ours tmp
+  conflicts=$(git diff --name-only --diff-filter=U)
+  [ -n "$conflicts" ] || return 1
+  tmp=$(mktemp -d)
+  for p in $conflicts; do
+    case $p in "$old"/*) ;; *) return 1 ;; esac
+    ours=$new/${p#"$old"/}
+    [ -f "$ours" ] || return 1
+    git show ":1:$p" > "$tmp/base" 2>/dev/null || return 1
+    git show ":3:$p" > "$tmp/theirs" 2>/dev/null || return 1
+    rewrite_setup "$tmp/base" "$tmp/theirs"
+    git merge-file "$ours" "$tmp/base" "$tmp/theirs" || return 1
+    git rm -q -f "$p"
+    git add "$ours"
+  done
+  rm -rf "$tmp"
+  git commit -q --no-edit
+}
+
+commit_fixups() {
+  git add -A "plugins/$upstream" .claude-plugin/marketplace.json
+  if ! git diff --cached --quiet; then
+    git commit -q -m "Sync $upstream to $tag: reapply fleet fixups"
+    echo "sync: committed fixups"
+  fi
+}
+
+case $upstream in
+  engineering)
+    url=${SYNC_ENGINEERING_URL:-https://github.com/mattpocock/skills}
+    git subtree pull --prefix=plugins/engineering "$url" "$tag" --squash -m "Sync engineering to $tag" ||
+      resolve_setup_conflicts ||
+      die "merge conflicts left; resolve them, commit, then rerun sync engineering $tag"
+    cp plugins/engineering/LICENSE plugins/engineering/skills/LICENSE
+    rename_setup
+    ;;
+  design)
+    url=${SYNC_DESIGN_URL:-https://github.com/pbakaus/impeccable}
+    cache=${SYNC_DESIGN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/skills-sync/impeccable}
+    # A full clone: a blobless one can split but can't serve the subtree pull.
+    if [ ! -d "$cache/.git" ]; then
+      mkdir -p "$(dirname "$cache")"
+      git clone -q --no-checkout "$url" "$cache"
+      git -C "$cache" sparse-checkout set plugin
+    fi
+    git -C "$cache" fetch -q --tags --force origin
+    git -C "$cache" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null || die "no tag $tag in $url"
+    split=split/$tag
+    if ! git -C "$cache" rev-parse -q --verify "refs/heads/$split" >/dev/null; then
+      # split needs the prefix in the working tree; takes minutes on a new tag.
+      git -C "$cache" -c advice.detachedHead=false checkout -q --detach "$tag"
+      git -C "$cache" subtree split --prefix=plugin "$tag" -b "$split"
+    fi
+    if [ -d plugins/design ]; then
+      git subtree pull --prefix=plugins/design "$cache" "$split" --squash -m "Sync design to $tag"
+    else
+      git subtree add --prefix=plugins/design "$cache" "$split" --squash
+    fi
+    git -C "$cache" show "$tag:LICENSE" > plugins/design/LICENSE
+    git -C "$cache" show "$tag:NOTICE.md" > plugins/design/NOTICE.md
+    ;;
+  *) usage ;;
+esac
+
+commit_fixups
+echo "sync: $upstream at $tag. Next: update the pinned tag in README.md and plugins/$upstream/CHANGES.md, then npm test."
